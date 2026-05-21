@@ -498,27 +498,12 @@ def register_routes(app: FastAPI) -> None:
 
                     try:
                         mapped_lang = _map_language(config.get("language", "auto"))
-                        
+
                         if mapped_lang not in AVAILABLE_LANGUAGES:
                             await websocket.send_json({"type": "error", "message": f"unsupported lang {mapped_lang!r}"})
                             continue
-
-                        # Run inference in a background thread
-                        wav, dur = await asyncio.to_thread(
-                            _do_synthesize,
-                            state,
-                            text=sentence_text,
-                            voice=config.get("voice", "M1"),
-                            lang=mapped_lang,
-                            speed=config.get("speed", 1.0),
-                            steps=None,
-                            max_chunk_length=None,
-                            silence_duration=None,
-                        )
-
-                        # Cast float32 wav arrays (-1.0 to 1.0) into 16-bit PCM bytes
-                        pcm_data = (np.clip(wav, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-
+                            
+                        # 1. We send the start signal immediately so the frontend knows audio is coming
                         await websocket.send_json({
                             "type": "audio.start",
                             "sentence_index": sentence_index,
@@ -527,12 +512,41 @@ def register_routes(app: FastAPI) -> None:
                             "sample_rate": state.tts.sample_rate
                         })
 
-                        await websocket.send_bytes(pcm_data)
+                        # 2. Initialize the generator (This is instant and doesn't block)
+                        # We must resolve the voice style object first
+                        style = state.tts.get_voice_style(config.get("voice", "M1"))
+                        
+                        chunk_generator = state.tts.synthesize_generator(
+                            text=sentence_text,
+                            voice_style=style,
+                            lang=mapped_lang,
+                            speed=config.get("speed", 1.0)
+                        )
 
+                        total_len_pcm_data = 0
+                        
+                        # 3. Safely iterate through the chunks without freezing the server
+                        while True:
+                            # Pass 'None' as the default value to next(). 
+                            # This completely prevents the StopIteration error.
+                            chunk_data = await asyncio.to_thread(next, chunk_generator, None)
+                            
+                            if chunk_data is None:
+                                # The generator returned None, meaning this sentence is fully spoken
+                                break
+
+                            wav, dur = chunk_data
+                                
+                            # Convert the chunk and instantly send it to the WebRTC socket
+                            pcm_data = (np.clip(wav, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+                            await websocket.send_bytes(pcm_data)
+                            total_len_pcm_data += len(pcm_data)
+
+                        # 4. Notify the frontend the sentence is done
                         await websocket.send_json({
                             "type": "audio.done",
                             "sentence_index": sentence_index,
-                            "total_bytes": len(pcm_data),
+                            "total_bytes": total_len_pcm_data,
                             "error": False
                         })
 

@@ -327,6 +327,108 @@ class TTS:
             print(f"Array shape: {wav_cat.shape}")
 
         return wav_cat, dur_cat
+    
+    def synthesize_generator(
+        self,
+        text: str,
+        voice_style: Style,
+        total_steps: int = DEFAULT_TOTAL_STEPS,
+        speed: float = DEFAULT_SPEED,
+        max_chunk_length: Optional[int] = None,
+        silence_duration: float = DEFAULT_SILENCE_DURATION,
+        lang: Optional[str] = None,
+        verbose: bool = False,
+    ):
+        """Synthesize speech from text and yield audio chunks on the fly.
+
+        This method chunks long text and yields the waveform for each chunk 
+        as soon as it is generated, making it ideal for real-time streaming.
+
+        Args:
+            text: Text to synthesize
+            voice_style: Voice style object
+            total_steps: Number of synthesis steps (default: 8)
+            speed: Speech speed multiplier (default: 1.05)
+            max_chunk_length: Max characters per chunk. If None, automatically
+                determined based on language (300 for most, 120 for Korean)
+            silence_duration: Silence between chunks in seconds (default: 0.3)
+            lang: Language code for synthesis. If ``None`` (default), the
+                code is resolved from the loaded model.
+            verbose: If True, print detailed progress information (default: False)
+
+        Yields:
+            Tuple of (waveform, duration) for each processed chunk.
+        """
+        if not text or not text.strip():
+            raise ValueError("Text cannot be empty")
+
+        if lang is None:
+            lang = UNKNOWN_LANGUAGE if self.is_multilingual else DEFAULT_LANGUAGE
+
+        if self.is_multilingual:
+            if lang not in AVAILABLE_LANGUAGES:
+                raise ValueError(
+                    f"Invalid language: '{lang}'. "
+                    f"Supported languages: {', '.join(AVAILABLE_LANGUAGES)}"
+                )
+            effective_lang: Optional[str] = lang
+        else:
+            if lang != "en" and verbose:
+                print(f"⚠️  Model '{self.model_name}' is English-only. Ignoring lang='{lang}'.")
+            effective_lang = None
+
+        if len(text) > MAX_TEXT_LENGTH:
+            raise ValueError(
+                f"Text length ({len(text)}) exceeds maximum allowed length "
+                f"({MAX_TEXT_LENGTH}). Please split your text into smaller chunks."
+            )
+
+        if not isinstance(voice_style, Style):
+            raise TypeError(
+                f"voice_style must be a Style object, got {type(voice_style).__name__}. "
+                f"Use get_voice_style() to load a style."
+            )
+
+        is_valid, unsupported = self.model.text_processor.validate_text(text)
+        if not is_valid:
+            raise ValueError(f"Found {len(unsupported)} unsupported character(s): {unsupported}")
+
+        if max_chunk_length is None:
+            max_chunk_length = (
+                DEFAULT_MAX_CHUNK_LENGTH_KO if effective_lang == "ko" else DEFAULT_MAX_CHUNK_LENGTH
+            )
+
+        text_chunks = chunk_text(text, max_chunk_length)
+
+        if verbose:
+            print(f"Split into {len(text_chunks)} chunk(s) for generator stream")
+
+        # Pre-allocate silence array if needed
+        silence_wav = None
+        if silence_duration > 0:
+            silence_wav = np.zeros((1, int(silence_duration * self.sample_rate)), dtype=np.float32)
+
+        for i, text_chunk in enumerate(text_chunks):
+            logger.debug(f"Processing chunk {i+1}/{len(text_chunks)}")
+            
+            # Generate the current chunk
+            wav, dur_onnx = self.model(
+                [text_chunk], voice_style, total_steps, speed, effective_lang
+            )
+
+            if wav.shape[0] != 1:
+                raise RuntimeError(f"Expected wav shape (1, samples), got {wav.shape}")
+
+            chunk_wav = wav
+            chunk_dur = dur_onnx
+
+            # Append silence if it's not the last chunk
+            if i < len(text_chunks) - 1 and silence_wav is not None:
+                chunk_wav = np.concatenate([wav, silence_wav], axis=1)
+                chunk_dur = dur_onnx + silence_duration
+
+            # Yield the chunk immediately before processing the next one
+            yield chunk_wav, chunk_dur
 
     def save_audio(
         self,
