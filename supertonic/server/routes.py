@@ -17,14 +17,16 @@ so that downstream error parsers keep working.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Optional, TYPE_CHECKING
 
 import numpy as np
-from fastapi import APIRouter, FastAPI, File, Form, Request, Response, UploadFile
+from fastapi import APIRouter, FastAPI, File, Form, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from .. import __version__
@@ -417,5 +419,184 @@ def register_routes(app: FastAPI) -> None:
                 )
             )
         return BatchResponse(items=results)
+
+    @router.get("/v1/audio/voices")
+    def openai_compat_voices(request: Request):
+        """
+        OpenAI/vLLM-Omni compatible endpoint to list available voices.
+        Expected by the frontend/WebRTC server to populate the voice dropdown.
+        """
+        state = _state(request)
+        if state.tts is None:
+            return _error(503, "server not ready", "not_ready", type_="server_error")
+        
+        # Fetch the built-in Supertonic voices (M1-M5, F1-F5)
+        builtin_voices = list(state.tts.voice_style_names)
+        
+        # Fetch any custom styles the user has imported
+        custom_voices = list(state.custom_styles.keys())
+        
+        # The Omni API expects a flat list of all voice names under the 'voices' key
+        all_voices = builtin_voices + custom_voices
+        
+        # The Omni API also expects an 'uploaded_voices' metadata array.
+        # We map Supertonic's custom styles to this format.
+        uploaded_voices = []
+        for name in custom_voices:
+            uploaded_voices.append({
+                "name": name,
+                "speaker_description": "Supertonic custom imported style"
+            })
+            
+        return JSONResponse(content={
+            "voices": sorted(all_voices),
+            "uploaded_voices": uploaded_voices
+        })
+
+    # Map friendly OpenAI language names to Supertonic ISO codes
+    LANG_MAP = {
+        "english": "en", "chinese": "zh", "japanese": "ja", 
+        "korean": "ko", "german": "de", "french": "fr", 
+        "russian": "ru", "portuguese": "pt", "spanish": "es", 
+        "italian": "it", "auto": "na"
+    }
+
+    def _map_language(lang_str: str) -> str:
+        if not lang_str:
+            return "na"
+        lang_str_lower = lang_str.lower()
+        if lang_str_lower in LANG_MAP:
+            return LANG_MAP[lang_str_lower]
+        return lang_str
+    
+    @router.websocket("/v1/audio/speech/stream")
+    async def openai_compat_speech_stream(websocket: WebSocket):
+        await websocket.accept()
+        
+        state = websocket.app.state.server_state
+        if state.tts is None:
+            await websocket.send_json({"type": "error", "message": "server not ready"})
+            await websocket.close(code=1011)
+            return
+
+        config = {}
+        text_buffer = ""
+        sentence_queue = asyncio.Queue()
+
+        # --- BACKGROUND WORKER TASK ---
+        async def tts_worker():
+            sentence_index = 0
+            total_sentences = 0
+            try:
+                while True:
+                    # Wait for the next sentence from the queue
+                    sentence_text = await sentence_queue.get()
+                    
+                    # A 'None' value is our sentinel signal to stop the worker
+                    if sentence_text is None:
+                        break
+
+                    try:
+                        mapped_lang = _map_language(config.get("language", "auto"))
+                        
+                        if mapped_lang not in AVAILABLE_LANGUAGES:
+                            await websocket.send_json({"type": "error", "message": f"unsupported lang {mapped_lang!r}"})
+                            continue
+
+                        # Run inference in a background thread
+                        wav, dur = await asyncio.to_thread(
+                            _do_synthesize,
+                            state,
+                            text=sentence_text,
+                            voice=config.get("voice", "M1"),
+                            lang=mapped_lang,
+                            speed=config.get("speed", 1.0),
+                            steps=None,
+                            max_chunk_length=None,
+                            silence_duration=None,
+                        )
+
+                        # Cast float32 wav arrays (-1.0 to 1.0) into 16-bit PCM bytes
+                        pcm_data = (np.clip(wav, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+
+                        await websocket.send_json({
+                            "type": "audio.start",
+                            "sentence_index": sentence_index,
+                            "sentence_text": sentence_text,
+                            "format": "pcm",
+                            "sample_rate": state.tts.sample_rate
+                        })
+
+                        await websocket.send_bytes(pcm_data)
+
+                        await websocket.send_json({
+                            "type": "audio.done",
+                            "sentence_index": sentence_index,
+                            "total_bytes": len(pcm_data),
+                            "error": False
+                        })
+
+                        sentence_index += 1
+                        total_sentences += 1
+
+                    except Exception as e:
+                        logger.exception("Streaming synthesis failed")
+                        await websocket.send_json({"type": "error", "message": str(e)})
+
+                    finally:
+                        # Tell the queue we finished processing this item
+                        sentence_queue.task_done()
+                        
+                # Only send session.done after the queue is completely empty and finished
+                await websocket.send_json({
+                    "type": "session.done",
+                    "total_sentences": total_sentences
+                })
+
+            except asyncio.CancelledError:
+                # Worker was killed (e.g. client disconnected early)
+                pass
+
+
+        # Start the background worker immediately
+        worker_task = asyncio.create_task(tts_worker())
+
+        # --- MAIN WEBSOCKET LISTENER ---
+        try:
+            while True:
+                msg = await websocket.receive_json()
+                msg_type = msg.get("type")
+
+                if msg_type == "session.config":
+                    config = msg
+                    
+                elif msg_type == "input.text":
+                    text_buffer += msg.get("text", "")
+                    
+                    # Split sentences dynamically
+                    sentences = re.split(r'(?<=[.!?。！？\n])(?=\s|$)', text_buffer)
+                    
+                    if len(sentences) > 1:
+                        for s in sentences[:-1]:
+                            if s.strip():
+                                # Instantly put the sentence in the queue instead of blocking
+                                await sentence_queue.put(s.strip())
+                        text_buffer = sentences[-1]
+                        
+                elif msg_type == "input.done":
+                    if text_buffer.strip():
+                        await sentence_queue.put(text_buffer.strip())
+                        text_buffer = ""
+                    
+                    # Send the sentinel 'None' to tell the worker we are done sending text
+                    await sentence_queue.put(None)
+                    
+        except WebSocketDisconnect:
+            logger.info("WebSocket disconnected gracefully.")
+        except Exception as e:
+            logger.error(f"WebSocket error: {e}")
+        finally:
+            # Clean up: If the client disconnects or an error occurs, kill the TTS worker
+            worker_task.cancel()
 
     app.include_router(router)
