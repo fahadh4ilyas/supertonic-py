@@ -535,7 +535,7 @@ def register_routes(app: FastAPI) -> None:
                             "sentence_index": sentence_index,
                             "sentence_text": sentence_text,
                             "format": "pcm",
-                            "sample_rate": state.tts.sample_rate
+                            "sample_rate": 24000
                         })
 
                         await websocket.send_bytes(pcm_data)
