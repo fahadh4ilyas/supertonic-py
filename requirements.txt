@@ -4,5 +4,6 @@
 onnxruntime>=1.19.0; python_version < "3.13"
 onnxruntime>=1.20.0; python_version >= "3.13"
 numpy>=1.21.0
+scipy>=1.17.1
 soundfile>=0.10.0
 huggingface-hub>=0.10.0

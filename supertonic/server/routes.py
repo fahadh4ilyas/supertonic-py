@@ -21,8 +21,10 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import re
 from pathlib import Path
+from scipy.signal import resample_poly
 from typing import Any, Optional, TYPE_CHECKING
 
 import numpy as np
@@ -515,6 +517,15 @@ def register_routes(app: FastAPI) -> None:
                             max_chunk_length=None,
                             silence_duration=None,
                         )
+
+                        target_sr = 24000
+                        orig_sr = state.tts.sample_rate
+                        
+                        if orig_sr != target_sr:
+                            # Find greatest common divisor to keep up/down factors small
+                            g = math.gcd(target_sr, orig_sr)
+                            # resample_poly applies high-quality anti-aliasing
+                            wav = resample_poly(wav, target_sr // g, orig_sr // g)
 
                         # Cast float32 wav arrays (-1.0 to 1.0) into 16-bit PCM bytes
                         pcm_data = (np.clip(wav, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
