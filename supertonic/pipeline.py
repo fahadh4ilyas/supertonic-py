@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Optional, Union
 
@@ -405,8 +406,10 @@ class TTS:
 
         # Pre-allocate silence array if needed
         silence_wav = None
+        silence_wav_half = None
         if silence_duration > 0:
             silence_wav = np.zeros((1, int(silence_duration * self.sample_rate)), dtype=np.float32)
+            silence_wav_half = np.zeros((1, int(silence_duration * self.sample_rate / 2.0)), dtype=np.float32)
 
         for i, text_chunk in enumerate(text_chunks):
             logger.debug(f"Processing chunk {i+1}/{len(text_chunks)}")
@@ -419,13 +422,26 @@ class TTS:
             if wav.shape[0] != 1:
                 raise RuntimeError(f"Expected wav shape (1, samples), got {wav.shape}")
 
+            audio = wav[0]
+            active_speech = np.where(np.abs(audio) > 0.002)[0]
+            
+            if len(active_speech) > 0:
+                margin = int(self.sample_rate * 0.04)  # 40ms buffer
+                start = max(0, active_speech[0] - margin)
+                end = min(len(audio), active_speech[-1] + margin)
+                wav = wav[:, start:end]
+
             chunk_wav = wav
             chunk_dur = dur_onnx
 
             # Append silence if it's not the last chunk
-            if i < len(text_chunks) - 1 and silence_wav is not None:
-                chunk_wav = np.concatenate([wav, silence_wav], axis=1)
-                chunk_dur = dur_onnx + silence_duration
+            if silence_wav is not None:
+                if re.search(r'[,，]["\')\]]*$', text_chunk.strip()):
+                    chunk_wav = np.concatenate([wav, silence_wav_half], axis=1)
+                    chunk_dur = dur_onnx + silence_duration / 2.0
+                else:
+                    chunk_wav = np.concatenate([wav, silence_wav], axis=1)
+                    chunk_dur = dur_onnx + silence_duration
 
             # Yield the chunk immediately before processing the next one
             yield chunk_wav, chunk_dur
