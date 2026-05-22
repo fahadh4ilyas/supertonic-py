@@ -30,7 +30,7 @@ from fastapi import APIRouter, FastAPI, File, Form, Request, Response, UploadFil
 from fastapi.responses import JSONResponse
 
 from .. import __version__
-from ..config import AVAILABLE_LANGUAGES
+from ..config import AVAILABLE_LANGUAGES, DEFAULT_SILENCE_DURATION
 from . import styles_store
 from .audio import (
     SUPPORTED_FORMATS,
@@ -520,7 +520,9 @@ def register_routes(app: FastAPI) -> None:
                             text=sentence_text,
                             voice_style=style,
                             lang=mapped_lang,
-                            speed=config.get("speed", 1.0)
+                            speed=config.get("speed", 1.0),
+                            max_chunk_length=config.get("max_chunk_length", None),
+                            silence_duration=config.get("silence_duration", DEFAULT_SILENCE_DURATION),
                         )
 
                         total_len_pcm_data = 0
