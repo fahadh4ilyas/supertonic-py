@@ -590,7 +590,7 @@ def register_routes(app: FastAPI) -> None:
                     text_buffer += msg.get("text", "")
                     
                     # Split sentences dynamically
-                    sentences = re.split(r'(?<=[.!?。！？\n])(?=\s|$)', text_buffer)
+                    sentences = re.split(r'(?<=[.!?。！？,\n])(?=\s|$)', text_buffer)
                     
                     if len(sentences) > 1:
                         for s in sentences[:-1]:
