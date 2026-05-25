@@ -497,7 +497,7 @@ def register_routes(app: FastAPI) -> None:
                         break
 
                     try:
-                        mapped_lang = _map_language(config.get("language", "auto"))
+                        mapped_lang = _map_language(config.get("language", "auto").lower())
 
                         if mapped_lang not in AVAILABLE_LANGUAGES:
                             await websocket.send_json({"type": "error", "message": f"unsupported lang {mapped_lang!r}"})
