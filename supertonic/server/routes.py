@@ -455,10 +455,38 @@ def register_routes(app: FastAPI) -> None:
 
     # Map friendly OpenAI language names to Supertonic ISO codes
     LANG_MAP = {
-        "english": "en", "chinese": "zh", "japanese": "ja", 
-        "korean": "ko", "german": "de", "french": "fr", 
-        "russian": "ru", "portuguese": "pt", "spanish": "es", 
-        "italian": "it", "auto": "na"
+        "arabic": "ar",
+        "bulgarian": "bg",
+        "croatian": "hr",
+        "czech": "cs",
+        "danish": "da",
+        "dutch": "nl",
+        "english": "en",
+        "estonian": "et",
+        "finnish": "fi",
+        "french": "fr",
+        "german": "de",
+        "greek": "el",
+        "hindi": "hi",
+        "hungarian": "hu",
+        "indonesian": "id",
+        "italian": "it",
+        "japanese": "ja",
+        "korean": "ko",
+        "latvian": "lv",
+        "lithuanian": "lt",
+        "polish": "pl",
+        "portuguese": "pt",
+        "romanian": "ro",
+        "russian": "ru",
+        "slovak": "sk",
+        "slovenian": "sl",
+        "spanish": "es",
+        "swedish": "sv",
+        "turkish": "tr",
+        "ukrainian": "uk",
+        "vietnamese": "vi",
+        "auto": "na"
     }
 
     def _map_language(lang_str: str) -> str:
