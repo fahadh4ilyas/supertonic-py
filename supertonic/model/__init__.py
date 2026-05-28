@@ -42,7 +42,8 @@ from .duration_predictor import DurationPredictor
 from .text_encoder import TextEncoder
 from .vector_field import VectorField
 from .vocoder import Vocoder
-from supertonic.core import UnicodeProcessor
+from supertonic.core import Style, UnicodeProcessor
+from supertonic.loader import load_voice_style_from_json_file, load_voice_style_from_name
 from supertonic.utils import chunk_text as _chunk_text_util
 
 
@@ -91,10 +92,12 @@ class SupertonicModel(nn.Module):
         ldim: int = 24,
         chunk_compress_factor: int = 6,
         unicode_indexer: str | Path | None = None,
+        model_dir: str | Path | None = None,
     ):
         super().__init__()
 
         self.unicode_indexer: Path | None = Path(unicode_indexer) if unicode_indexer is not None else None
+        self.model_dir: Path | None = Path(model_dir) if model_dir is not None else None
 
         # Resolve config
         if isinstance(config, (str, Path)):
@@ -161,12 +164,36 @@ class SupertonicModel(nn.Module):
     # High-level synthesis API (mirrors pipeline.TTS)
     # ------------------------------------------------------------------
 
+    def get_voice_style(self, voice_name: str) -> Style:
+        """Load a voice style by name from the model directory.
+
+        Args:
+            voice_name: Name of the voice style (e.g. ``'M1'..'M5'``, ``'F1'..'F5'``).
+
+        Returns:
+            Style object containing voice style vectors.
+        """
+        if self.model_dir is None:
+            raise ValueError("model_dir not set on model.")
+        return load_voice_style_from_name(self.model_dir, voice_name)
+
+    @staticmethod
+    def get_voice_style_from_path(voice_style_path: str | Path) -> Style:
+        """Load a voice style from a JSON file path.
+
+        Args:
+            voice_style_path: Path to the voice style JSON file.
+
+        Returns:
+            Style object containing voice style vectors.
+        """
+        return load_voice_style_from_json_file(voice_style_path)
+
     @torch.inference_mode()
     def synthesize(
         self,
         text: str,
-        style_ttl: np.ndarray,
-        style_dp: np.ndarray,
+        voice_style: Style,
         total_steps: int = 8,
         speed: float = 1.05,
         silence_duration: float = 0.3,
@@ -177,8 +204,7 @@ class SupertonicModel(nn.Module):
 
         Args:
             text: Text to synthesize.
-            style_ttl: Style vector for the text-to-latent path, shape (1, 50, 256).
-            style_dp: Style vector for the duration predictor, shape (1, 8, 16).
+            voice_style: Voice style object containing ttl and dp vectors.
             total_steps: Number of diffusion steps (default: 8).
             speed: Speech speed multiplier (default: 1.05).
             silence_duration: Seconds of silence between chunks (default: 0.3).
@@ -213,8 +239,8 @@ class SupertonicModel(nn.Module):
 
             wav_t, dur_t = self.forward(
                 text_ids=torch.from_numpy(text_ids_np),
-                style_ttl=torch.from_numpy(style_ttl),
-                style_dp=torch.from_numpy(style_dp),
+                style_ttl=torch.from_numpy(voice_style.ttl),
+                style_dp=torch.from_numpy(voice_style.dp),
                 text_mask=torch.from_numpy(text_mask_np),
                 total_steps=total_steps,
                 speed=speed,
@@ -239,8 +265,7 @@ class SupertonicModel(nn.Module):
     def synthesize_generator(
         self,
         text: str,
-        style_ttl: np.ndarray,
-        style_dp: np.ndarray,
+        voice_style: Style,
         total_steps: int = 8,
         speed: float = 1.05,
         silence_duration: float = 0.3,
@@ -251,8 +276,7 @@ class SupertonicModel(nn.Module):
 
         Args:
             text: Text to synthesize.
-            style_ttl: Style vector for the text-to-latent path, shape (1, 50, 256).
-            style_dp: Style vector for the duration predictor, shape (1, 8, 16).
+            voice_style: Voice style object containing ttl and dp vectors.
             total_steps: Number of diffusion steps (default: 8).
             speed: Speech speed multiplier (default: 1.05).
             silence_duration: Seconds of silence between chunks (default: 0.3).
@@ -285,8 +309,8 @@ class SupertonicModel(nn.Module):
 
             wav_t, dur_t = self.forward(
                 text_ids=torch.from_numpy(text_ids_np),
-                style_ttl=torch.from_numpy(style_ttl),
-                style_dp=torch.from_numpy(style_dp),
+                style_ttl=torch.from_numpy(voice_style.ttl),
+                style_dp=torch.from_numpy(voice_style.dp),
                 text_mask=torch.from_numpy(text_mask_np),
                 total_steps=total_steps,
                 speed=speed,
@@ -484,7 +508,7 @@ class SupertonicModel(nn.Module):
         indexer_path = model_dir / "unicode_indexer.json"
         unicode_indexer = indexer_path if indexer_path.exists() else None
 
-        model = cls(config=config, unicode_indexer=unicode_indexer)
+        model = cls(config=config, unicode_indexer=unicode_indexer, model_dir=model_dir)
 
         # Load weights
         state = safetensors.torch.load_file(str(model_dir / "model.safetensors"))

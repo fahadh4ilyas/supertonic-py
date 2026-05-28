@@ -57,12 +57,12 @@ def main():
 
         model = SupertonicModel.from_pretrained(str(input_dir))
         model.eval()
+        pt_style = model.get_voice_style(args.voice)
 
         t0 = time.perf_counter()
         wav_pt, dur_pt = model.synthesize(
             text=args.text,
-            style_ttl=style.ttl,
-            style_dp=style.dp,
+            voice_style=pt_style,
             total_steps=args.steps,
             speed=args.speed,
         )
