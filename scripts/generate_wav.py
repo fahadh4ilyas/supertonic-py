@@ -21,7 +21,7 @@ import soundfile as sf
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from supertonic import TTS
-from supertonic.loader import get_cache_dir, load_voice_style_from_json_file
+from supertonic.loader import get_cache_dir
 from supertonic.model import SupertonicModel
 
 
@@ -37,17 +37,13 @@ def main():
     parser.add_argument("--lang", type=str, default="na", help="Language code")
     parser.add_argument("--pytorch-only", action="store_true")
     parser.add_argument("--onnx-only", action="store_true")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Torch device for PyTorch model (e.g. 'cuda', 'cpu'). Default: CPU.")
     args = parser.parse_args()
 
     input_dir: Path = args.input_dir if args.input_dir is not None else get_cache_dir("supertonic-3")
-    voice_dir = input_dir / "voice_styles"
 
     print(f"Model directory: {input_dir}")
-
-    # ---- Load voice style ----
-    print(f"Loading voice style '{args.voice}'...")
-    style = load_voice_style_from_json_file(str(voice_dir / f"{args.voice}.json"))
-    print(f"  style_ttl: {style.ttl.shape}  |  style_dp: {style.dp.shape}")
 
     # ---- PyTorch ----
     if not args.onnx_only:
@@ -55,7 +51,7 @@ def main():
         print("PyTorch Pipeline (SupertonicModel.synthesize)")
         print("=" * 55)
 
-        model = SupertonicModel.from_pretrained(str(input_dir))
+        model = SupertonicModel.from_pretrained(str(input_dir), device=args.device)
         model.eval()
         pt_style = model.get_voice_style(args.voice)
 
