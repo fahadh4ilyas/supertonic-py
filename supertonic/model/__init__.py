@@ -488,11 +488,15 @@ class SupertonicModel(nn.Module):
         }
 
     @classmethod
-    def from_pretrained(cls, model_dir: str | Path) -> "SupertonicModel":
+    def from_pretrained(
+        cls, model_dir: str | Path, device: str | torch.device | None = None,
+    ) -> "SupertonicModel":
         """Load model from a directory created by save_pretrained.
 
         Args:
             model_dir: Path to directory containing tts.json and model.safetensors.
+            device: Torch device to place the model on (e.g. ``"cuda"``, ``"cpu"``).
+                Default ``None`` keeps weights on CPU.
 
         Returns:
             SupertonicModel with pretrained weights loaded.
@@ -513,6 +517,9 @@ class SupertonicModel(nn.Module):
         # Load weights
         state = safetensors.torch.load_file(str(model_dir / "model.safetensors"))
         model.load_state_dict(state, strict=False)
+
+        if device is not None:
+            model = model.to(device)
 
         return model
 
