@@ -364,7 +364,10 @@ def main():
     print(f"Total ONNX parameters: {len(onnx_weights)}")
 
     print("Creating PyTorch model...")
-    model = SupertonicModel()
+    model = SupertonicModel(
+        config=str(input_dir / "tts.json"),
+        unicode_indexer=str(input_dir / "unicode_indexer.json"),
+    )
     model.eval()
     state_dict = model.state_dict()
     print(f"Total PyTorch parameters: {len(state_dict)}")
@@ -400,17 +403,20 @@ def main():
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Copy original tts.json from ONNX cache
+    # Copy original tts.json and unicode_indexer.json from ONNX cache
     import shutil
     config_src = input_dir / "tts.json"
     config_dst = output_dir / "tts.json"
     shutil.copy(config_src, config_dst)
+    indexer_src = input_dir / "unicode_indexer.json"
+    shutil.copy(indexer_src, output_dir / "unicode_indexer.json")
 
     # Save model in safetensors format
     import safetensors.torch
     safe_state = {k: v.contiguous() if isinstance(v, torch.Tensor) else v for k, v in state_dict.items()}
     safetensors.torch.save_file(safe_state, str(output_dir / "model.safetensors"))
     print(f"Saved: {output_dir / 'tts.json'}")
+    print(f"Saved: {output_dir / 'unicode_indexer.json'}")
     print(f"Saved: {output_dir / 'model.safetensors'}")
     # Remove old .pt file if it exists
     old_pt = output_dir / "supertonic_pytorch.pt"

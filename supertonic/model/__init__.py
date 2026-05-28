@@ -90,8 +90,11 @@ class SupertonicModel(nn.Module):
         base_chunk_size: int = 512,
         ldim: int = 24,
         chunk_compress_factor: int = 6,
+        unicode_indexer: str | Path | None = None,
     ):
         super().__init__()
+
+        self.unicode_indexer: Path | None = Path(unicode_indexer) if unicode_indexer is not None else None
 
         # Resolve config
         if isinstance(config, (str, Path)):
@@ -164,11 +167,11 @@ class SupertonicModel(nn.Module):
         text: str,
         style_ttl: np.ndarray,
         style_dp: np.ndarray,
-        unicode_indexer: str | Path,
         total_steps: int = 8,
         speed: float = 1.05,
         silence_duration: float = 0.3,
         max_chunk_length: int = 300,
+        lang: Optional[str] = "na",
     ) -> tuple[np.ndarray, np.ndarray]:
         """Synthesize speech from text.
 
@@ -176,21 +179,27 @@ class SupertonicModel(nn.Module):
             text: Text to synthesize.
             style_ttl: Style vector for the text-to-latent path, shape (1, 50, 256).
             style_dp: Style vector for the duration predictor, shape (1, 8, 16).
-            unicode_indexer: Path to unicode_indexer.json from the model cache.
             total_steps: Number of diffusion steps (default: 8).
             speed: Speech speed multiplier (default: 1.05).
             silence_duration: Seconds of silence between chunks (default: 0.3).
             max_chunk_length: Max characters per chunk (default: 300).
+            lang: Language code. Default ``"na"`` for multilingual models.
+                Set to ``None`` for English-only models (v1).
 
         Returns:
             Tuple of (waveform, duration):
                 - waveform: float32 array of shape (1, num_samples)
                 - duration: Total duration in seconds
         """
+        if self.unicode_indexer is None:
+            raise ValueError(
+                "unicode_indexer not set on model. Pass it to __init__ or "
+                "set model.unicode_indexer to a path to unicode_indexer.json."
+            )
         if not text or not text.strip():
             raise ValueError("Text cannot be empty")
 
-        text_processor = UnicodeProcessor(str(unicode_indexer))
+        text_processor = UnicodeProcessor(str(self.unicode_indexer))
 
         # Chunk text for processing
         text_chunks = self._chunk_text(text, max_chunk_length)
@@ -200,7 +209,7 @@ class SupertonicModel(nn.Module):
         dur_list = []
 
         for text_chunk in text_chunks:
-            text_ids_np, text_mask_np = text_processor([text_chunk])
+            text_ids_np, text_mask_np = text_processor([text_chunk], lang)
 
             wav_t, dur_t = self.forward(
                 text_ids=torch.from_numpy(text_ids_np),
@@ -232,11 +241,11 @@ class SupertonicModel(nn.Module):
         text: str,
         style_ttl: np.ndarray,
         style_dp: np.ndarray,
-        unicode_indexer: str | Path,
         total_steps: int = 8,
         speed: float = 1.05,
         silence_duration: float = 0.3,
         max_chunk_length: int = 300,
+        lang: Optional[str] = "na",
     ) -> Generator[tuple[np.ndarray, np.ndarray], None, None]:
         """Synthesize speech from text, yielding audio chunks on the fly.
 
@@ -244,19 +253,25 @@ class SupertonicModel(nn.Module):
             text: Text to synthesize.
             style_ttl: Style vector for the text-to-latent path, shape (1, 50, 256).
             style_dp: Style vector for the duration predictor, shape (1, 8, 16).
-            unicode_indexer: Path to unicode_indexer.json from the model cache.
             total_steps: Number of diffusion steps (default: 8).
             speed: Speech speed multiplier (default: 1.05).
             silence_duration: Seconds of silence between chunks (default: 0.3).
             max_chunk_length: Max characters per chunk (default: 300).
+            lang: Language code. Default ``"na"`` for multilingual models.
+                Set to ``None`` for English-only models (v1).
 
         Yields:
             Tuple of (waveform, duration) for each processed chunk.
         """
+        if self.unicode_indexer is None:
+            raise ValueError(
+                "unicode_indexer not set on model. Pass it to __init__ or "
+                "set model.unicode_indexer to a path to unicode_indexer.json."
+            )
         if not text or not text.strip():
             raise ValueError("Text cannot be empty")
 
-        text_processor = UnicodeProcessor(str(unicode_indexer))
+        text_processor = UnicodeProcessor(str(self.unicode_indexer))
         text_chunks = self._chunk_text(text, max_chunk_length)
 
         silence_wav = None
@@ -266,7 +281,7 @@ class SupertonicModel(nn.Module):
             silence_wav_half = np.zeros((1, int(silence_duration * self.sample_rate / 2.0)), dtype=np.float32)
 
         for i, text_chunk in enumerate(text_chunks):
-            text_ids_np, text_mask_np = text_processor([text_chunk])
+            text_ids_np, text_mask_np = text_processor([text_chunk], lang)
 
             wav_t, dur_t = self.forward(
                 text_ids=torch.from_numpy(text_ids_np),
@@ -311,7 +326,7 @@ class SupertonicModel(nn.Module):
     # ------------------------------------------------------------------
 
     def save_pretrained(self, save_dir: str | Path, config: dict | str | Path | None = None) -> None:
-        """Save model config and weights to a directory.
+        """Save model config, weights, and unicode indexer to a directory.
 
         Args:
             save_dir: Output directory path.
@@ -320,9 +335,11 @@ class SupertonicModel(nn.Module):
                     from model attributes.
 
         Creates:
-            {save_dir}/tts.json          – model configuration
-            {save_dir}/model.safetensors – weights in safetensors format
+            {save_dir}/tts.json              – model configuration
+            {save_dir}/model.safetensors     – weights in safetensors format
+            {save_dir}/unicode_indexer.json  – unicode indexer (if set on model)
         """
+        import shutil
 
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -346,6 +363,10 @@ class SupertonicModel(nn.Module):
             elif not state[k].is_contiguous():
                 state[k] = state[k].contiguous()
         safetensors.torch.save_file(state, str(save_dir / "model.safetensors"))
+
+        # Save unicode indexer if set
+        if self.unicode_indexer is not None:
+            shutil.copy(self.unicode_indexer, save_dir / "unicode_indexer.json")
 
     def _build_config(self) -> dict:
         """Reconstruct a tts.json-compatible config from model architecture."""
@@ -459,7 +480,11 @@ class SupertonicModel(nn.Module):
         with open(model_dir / "tts.json") as f:
             config = json.load(f)
 
-        model = cls(config=config)
+        # Resolve unicode_indexer if present
+        indexer_path = model_dir / "unicode_indexer.json"
+        unicode_indexer = indexer_path if indexer_path.exists() else None
+
+        model = cls(config=config, unicode_indexer=unicode_indexer)
 
         # Load weights
         state = safetensors.torch.load_file(str(model_dir / "model.safetensors"))
