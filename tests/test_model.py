@@ -28,6 +28,7 @@ importlib.reload(supertonic.model)
 
 from supertonic.config import get_model_cache_dir  # noqa: E402
 from supertonic.core import Supertonic, Style, UnicodeProcessor  # noqa: E402
+from supertonic.loader import get_cache_dir  # noqa: E402
 from supertonic.model import SupertonicModel  # noqa: E402
 
 _MODEL_NAME = "supertonic-3"
@@ -38,6 +39,14 @@ VOICE_STYLES_DIR = _MODEL_CACHE / "voice_styles"
 
 # Tolerance for MAE (mean absolute error)
 MAE_THRESHOLD = 0.1
+
+
+def _load_pytorch_model() -> SupertonicModel:
+    """Load PyTorch model from cached checkpoints, falling back to random init."""
+    candidate = get_cache_dir("supertonic-3")
+    if (candidate / "model.safetensors").exists():
+        return SupertonicModel.from_pretrained(str(candidate))
+    return SupertonicModel()
 
 
 def load_onnx_sessions():
@@ -130,11 +139,7 @@ def test_duration_predictor(sessions, text_ids, text_mask, style_dp, verbose=Tru
     )[0]
 
     # PyTorch inference
-    ckpt_dir = Path(__file__).resolve().parent.parent / "checkpoints"
-    if (ckpt_dir / "model.safetensors").exists():
-        model = SupertonicModel.from_pretrained(str(ckpt_dir))
-    else:
-        model = SupertonicModel()
+    model = _load_pytorch_model()
     model.eval()
     with torch.no_grad():
         pt_text_ids = torch.from_numpy(text_ids)
@@ -176,11 +181,7 @@ def test_text_encoder(sessions, text_ids, text_mask, style_ttl, verbose=True):
     )[0]
 
     # PyTorch inference
-    ckpt_dir = Path(__file__).resolve().parent.parent / "checkpoints"
-    if (ckpt_dir / "model.safetensors").exists():
-        model = SupertonicModel.from_pretrained(str(ckpt_dir))
-    else:
-        model = SupertonicModel()
+    model = _load_pytorch_model()
     model.eval()
     with torch.no_grad():
         pt_text_ids = torch.from_numpy(text_ids)
@@ -264,11 +265,7 @@ def test_vector_field(sessions, text_ids, text_mask, style_ttl, verbose=True):
     )[0]
 
     # PyTorch inference
-    ckpt_dir = Path(__file__).resolve().parent.parent / "checkpoints"
-    if (ckpt_dir / "model.safetensors").exists():
-        model = SupertonicModel.from_pretrained(str(ckpt_dir))
-    else:
-        model = SupertonicModel()
+    model = _load_pytorch_model()
     model.eval()
     with torch.no_grad():
         pt_noisy = torch.from_numpy(noisy_latent)
@@ -321,11 +318,7 @@ def test_vocoder(sessions, verbose=True):
     onnx_out = sessions["vocoder"].run(None, {"latent": latent})[0]
 
     # PyTorch inference
-    ckpt_dir = Path(__file__).resolve().parent.parent / "checkpoints"
-    if (ckpt_dir / "model.safetensors").exists():
-        model = SupertonicModel.from_pretrained(str(ckpt_dir))
-    else:
-        model = SupertonicModel()
+    model = _load_pytorch_model()
     model.eval()
     with torch.no_grad():
         pt_latent = torch.from_numpy(latent)
@@ -391,11 +384,7 @@ def test_end_to_end(sessions, text_ids, text_mask, style_ttl, style_dp, verbose=
     _ = np.random.randn(bsz, latent_dim, latent_len).astype(np.float32)  # consume the noise
 
     # --- PyTorch via model.SupertonicModel ---
-    ckpt_dir = Path(__file__).resolve().parent.parent / "checkpoints"
-    if (ckpt_dir / "model.safetensors").exists():
-        model = SupertonicModel.from_pretrained(str(ckpt_dir))
-    else:
-        model = SupertonicModel()
+    model = _load_pytorch_model()
     model.eval()
 
     # Use same text input as ONNX

@@ -13,10 +13,14 @@ Architecture adapted from ONNX graph analysis of supertonic-3.
 
 from __future__ import annotations
 
+import json
 import math
+import re
 from pathlib import Path
-from typing import Optional
+from typing import Generator, Optional
 
+import numpy as np
+import safetensors.torch
 import torch
 import torch.nn as nn
 
@@ -38,6 +42,8 @@ from .duration_predictor import DurationPredictor
 from .text_encoder import TextEncoder
 from .vector_field import VectorField
 from .vocoder import Vocoder
+from supertonic.core import UnicodeProcessor
+from supertonic.utils import chunk_text as _chunk_text_util
 
 
 __all__ = [
@@ -89,7 +95,6 @@ class SupertonicModel(nn.Module):
 
         # Resolve config
         if isinstance(config, (str, Path)):
-            import json
             with open(config) as f:
                 config = json.load(f)
         if config is None:
@@ -150,6 +155,158 @@ class SupertonicModel(nn.Module):
         return wav, dur_scaled
 
     # ------------------------------------------------------------------
+    # High-level synthesis API (mirrors pipeline.TTS)
+    # ------------------------------------------------------------------
+
+    @torch.inference_mode()
+    def synthesize(
+        self,
+        text: str,
+        style_ttl: np.ndarray,
+        style_dp: np.ndarray,
+        unicode_indexer: str | Path,
+        total_steps: int = 8,
+        speed: float = 1.05,
+        silence_duration: float = 0.3,
+        max_chunk_length: int = 300,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Synthesize speech from text.
+
+        Args:
+            text: Text to synthesize.
+            style_ttl: Style vector for the text-to-latent path, shape (1, 50, 256).
+            style_dp: Style vector for the duration predictor, shape (1, 8, 16).
+            unicode_indexer: Path to unicode_indexer.json from the model cache.
+            total_steps: Number of diffusion steps (default: 8).
+            speed: Speech speed multiplier (default: 1.05).
+            silence_duration: Seconds of silence between chunks (default: 0.3).
+            max_chunk_length: Max characters per chunk (default: 300).
+
+        Returns:
+            Tuple of (waveform, duration):
+                - waveform: float32 array of shape (1, num_samples)
+                - duration: Total duration in seconds
+        """
+        if not text or not text.strip():
+            raise ValueError("Text cannot be empty")
+
+        text_processor = UnicodeProcessor(str(unicode_indexer))
+
+        # Chunk text for processing
+        text_chunks = self._chunk_text(text, max_chunk_length)
+        silence_samples = int(silence_duration * self.sample_rate)
+
+        wav_list = []
+        dur_list = []
+
+        for text_chunk in text_chunks:
+            text_ids_np, text_mask_np = text_processor([text_chunk])
+
+            wav_t, dur_t = self.forward(
+                text_ids=torch.from_numpy(text_ids_np),
+                style_ttl=torch.from_numpy(style_ttl),
+                style_dp=torch.from_numpy(style_dp),
+                text_mask=torch.from_numpy(text_mask_np),
+                total_steps=total_steps,
+                speed=speed,
+            )
+            wav_list.append(wav_t.numpy())
+            dur_list.append(dur_t.numpy().item())
+
+        # Concatenate with silence between chunks
+        silence = np.zeros((1, silence_samples), dtype=np.float32)
+        arrays = []
+        for i, wav in enumerate(wav_list):
+            arrays.append(wav)
+            if i < len(wav_list) - 1:
+                arrays.append(silence)
+
+        wav_cat = np.concatenate(arrays, axis=1)
+        dur_cat = np.array([sum(dur_list) + silence_duration * (len(wav_list) - 1)])
+
+        return wav_cat, dur_cat
+
+    @torch.inference_mode()
+    def synthesize_generator(
+        self,
+        text: str,
+        style_ttl: np.ndarray,
+        style_dp: np.ndarray,
+        unicode_indexer: str | Path,
+        total_steps: int = 8,
+        speed: float = 1.05,
+        silence_duration: float = 0.3,
+        max_chunk_length: int = 300,
+    ) -> Generator[tuple[np.ndarray, np.ndarray], None, None]:
+        """Synthesize speech from text, yielding audio chunks on the fly.
+
+        Args:
+            text: Text to synthesize.
+            style_ttl: Style vector for the text-to-latent path, shape (1, 50, 256).
+            style_dp: Style vector for the duration predictor, shape (1, 8, 16).
+            unicode_indexer: Path to unicode_indexer.json from the model cache.
+            total_steps: Number of diffusion steps (default: 8).
+            speed: Speech speed multiplier (default: 1.05).
+            silence_duration: Seconds of silence between chunks (default: 0.3).
+            max_chunk_length: Max characters per chunk (default: 300).
+
+        Yields:
+            Tuple of (waveform, duration) for each processed chunk.
+        """
+        if not text or not text.strip():
+            raise ValueError("Text cannot be empty")
+
+        text_processor = UnicodeProcessor(str(unicode_indexer))
+        text_chunks = self._chunk_text(text, max_chunk_length)
+
+        silence_wav = None
+        silence_wav_half = None
+        if silence_duration > 0:
+            silence_wav = np.zeros((1, int(silence_duration * self.sample_rate)), dtype=np.float32)
+            silence_wav_half = np.zeros((1, int(silence_duration * self.sample_rate / 2.0)), dtype=np.float32)
+
+        for i, text_chunk in enumerate(text_chunks):
+            text_ids_np, text_mask_np = text_processor([text_chunk])
+
+            wav_t, dur_t = self.forward(
+                text_ids=torch.from_numpy(text_ids_np),
+                style_ttl=torch.from_numpy(style_ttl),
+                style_dp=torch.from_numpy(style_dp),
+                text_mask=torch.from_numpy(text_mask_np),
+                total_steps=total_steps,
+                speed=speed,
+            )
+            wav = wav_t.numpy()
+            dur = dur_t.numpy()
+
+            # Trim leading/trailing silence from the waveform
+            audio = wav[0]
+            active_speech = np.where(np.abs(audio) > 0.002)[0]
+            if len(active_speech) > 0:
+                margin = int(self.sample_rate * 0.04)
+                start = max(0, active_speech[0] - margin)
+                end = min(len(audio), active_speech[-1] + margin)
+                wav = wav[:, start:end]
+
+            chunk_wav = wav
+            chunk_dur = dur
+
+            if silence_wav is not None and i < len(text_chunks) - 1:
+                if re.search(r'[,，]["\')\]]*$', text_chunk.strip()):
+                    chunk_wav = np.concatenate([wav, silence_wav_half], axis=1)
+                    chunk_dur = dur + silence_duration / 2.0
+                else:
+                    chunk_wav = np.concatenate([wav, silence_wav], axis=1)
+                    chunk_dur = dur + silence_duration
+
+            yield chunk_wav, chunk_dur
+
+    @staticmethod
+    def _chunk_text(text: str, max_len: int) -> list[str]:
+        """Split text into chunks respecting sentence boundaries."""
+        return _chunk_text_util(text, max_len)
+
+    # ------------------------------------------------------------------
     # Serialization
     # ------------------------------------------------------------------
 
@@ -166,8 +323,6 @@ class SupertonicModel(nn.Module):
             {save_dir}/tts.json          – model configuration
             {save_dir}/model.safetensors – weights in safetensors format
         """
-        import json
-        import safetensors.torch
 
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -297,8 +452,6 @@ class SupertonicModel(nn.Module):
         Returns:
             SupertonicModel with pretrained weights loaded.
         """
-        import json
-        import safetensors.torch
 
         model_dir = Path(model_dir)
 

@@ -67,7 +67,6 @@ venv.bak/
 
 # Project specific
 outputs/
-checkpoints/
 *.safetensors
 *.onnx
 *.bin

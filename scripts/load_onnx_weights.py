@@ -2,13 +2,15 @@
 Extract ONNX weights and load them into the PyTorch SupertonicModel.
 
 Usage:
-    python scripts/load_onnx_weights.py [--output model.pt]
+    python scripts/load_onnx_weights.py [--input-dir <onnx_dir>] [--output-dir <output_dir>]
 
-Uses SUPERTONIC_CACHE_DIR env var (defaults to ~/.cache/supertonic3).
+Both arguments default to the supertonic-3 cache directory (~/.cache/supertonic3).
+If --input-dir is not set and the model is not cached, it is auto-downloaded.
 """
 
 from __future__ import annotations
 
+import argparse
 import re
 import sys
 from pathlib import Path
@@ -19,11 +21,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from supertonic.config import get_model_cache_dir  # noqa: E402
+from supertonic.loader import download_model, get_cache_dir, has_all_onnx_modules  # noqa: E402
 from supertonic.model import SupertonicModel  # noqa: E402
-
-_MODEL_NAME = "supertonic-3"
-MODEL_DIR = get_model_cache_dir(_MODEL_NAME) / "onnx"
 
 
 def extract_onnx_weights(onnx_path: str) -> dict[str, np.ndarray]:
@@ -33,10 +32,10 @@ def extract_onnx_weights(onnx_path: str) -> dict[str, np.ndarray]:
     return {init.name: to_array(init) for init in model.graph.initializer}
 
 
-def load_all_onnx_weights() -> dict[str, np.ndarray]:
+def load_all_onnx_weights(input_dir: Path) -> dict[str, np.ndarray]:
     all_weights = {}
     for fname in ["duration_predictor.onnx", "text_encoder.onnx", "vector_estimator.onnx", "vocoder.onnx"]:
-        for k, v in extract_onnx_weights(str(MODEL_DIR / fname)).items():
+        for k, v in extract_onnx_weights(str(input_dir / fname)).items():
             all_weights[f"{fname}/{k}"] = v
     return all_weights
 
@@ -341,8 +340,27 @@ def load_weights_to_model(onnx_weights: dict, model: SupertonicModel, verbose: b
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Extract ONNX weights and load into PyTorch SupertonicModel.")
+    parser.add_argument("--input-dir", type=Path, default=None,
+                        help="Directory containing ONNX model files. If not set, downloads to cache.")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Directory to save converted tts.json and model.safetensors. Defaults to cache.")
+    args = parser.parse_args()
+
+    cache_dir = get_cache_dir("supertonic-3")
+
+    output_dir: Path = args.output_dir if args.output_dir is not None else cache_dir
+
+    if args.input_dir is not None:
+        input_dir: Path = args.input_dir
+    else:
+        if not has_all_onnx_modules(cache_dir):
+            print("ONNX model not found in cache. Downloading supertonic-3 ...")
+            download_model(cache_dir, "supertonic-3")
+        input_dir = cache_dir / "onnx"
+
     print("Extracting ONNX weights...")
-    onnx_weights = load_all_onnx_weights()
+    onnx_weights = load_all_onnx_weights(input_dir)
     print(f"Total ONNX parameters: {len(onnx_weights)}")
 
     print("Creating PyTorch model...")
@@ -380,12 +398,11 @@ def main():
     loaded_n = sum(v.numel() for v in loaded.values())
     print(f"Total: {total:,} | Loaded: {loaded_n:,} ({100*loaded_n/total:.1f}%)")
 
-    output_dir = Path(__file__).resolve().parent.parent / "checkpoints"
-    output_dir.mkdir(exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Copy original tts.json from ONNX cache
     import shutil
-    config_src = MODEL_DIR / "tts.json"
+    config_src = input_dir / "tts.json"
     config_dst = output_dir / "tts.json"
     shutil.copy(config_src, config_dst)
 
