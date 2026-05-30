@@ -320,3 +320,94 @@ class SpeechPromptedAttention(nn.Module):
         out0, out1 = out[0], out[1]
         out = torch.cat([out0, out1], dim=-1)  # (B, L, 256)
         return self.out_fc(out)
+
+
+# ---------------------------------------------------------------------------
+# Style Token Layer (for AudioEncoder)
+# ---------------------------------------------------------------------------
+
+
+class StyleTokenLayer(nn.Module):
+    """Learnable query tokens cross-attend to audio features to produce style vectors.
+
+    Used in AudioEncoder to convert variable-length audio feature sequences
+    into fixed-size style embeddings (style_ttl and style_dp).
+
+    Architecture: n_style learnable query tokens → cross-attention over
+    audio feature sequence → output projection to style_value_dim.
+
+    Args:
+        input_dim: Dimension of input audio features.
+        n_style: Number of style tokens (50 for TTL, 8 for DP).
+        style_value_dim: Output dimension per token (256 for TTL, 16 for DP).
+        n_heads: Number of attention heads.
+        n_units: Hidden dimension for the output MLP.
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 256,
+        n_style: int = 50,
+        style_value_dim: int = 256,
+        n_heads: int = 2,
+        n_units: int = 256,
+    ):
+        super().__init__()
+        self.n_style = n_style
+        self.style_value_dim = style_value_dim
+        self.input_dim = input_dim
+
+        self.query_tokens = nn.Parameter(torch.randn(1, n_style, input_dim) * 0.02)
+
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=input_dim,
+            num_heads=n_heads,
+            batch_first=True,
+        )
+
+        self.proj_out = nn.Sequential(
+            nn.Linear(input_dim, n_units),
+            nn.GELU(),
+            nn.Linear(n_units, style_value_dim),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Cross-attend query tokens to audio features.
+
+        Args:
+            x: Audio feature sequence, shape (B, input_dim, L).
+            mask: Optional mask, shape (B, 1, L).
+
+        Returns:
+            Style vectors of shape (B, n_style, style_value_dim).
+        """
+        B = x.shape[0]
+
+        # Transpose: (B, input_dim, L) → (B, L, input_dim)
+        x_t = x.transpose(1, 2)
+
+        # Expand query tokens: (1, n_style, input_dim) → (B, n_style, input_dim)
+        queries = self.query_tokens.expand(B, -1, -1)
+
+        # Build key padding mask for cross-attention
+        key_padding_mask = None
+        if mask is not None:
+            # mask: (B, 1, L) → (B, L), invert for padding mask (True = ignore)
+            key_padding_mask = (mask.squeeze(1) == 0)
+
+        # Cross-attention: queries attend to audio features
+        out, _ = self.cross_attn(
+            query=queries,
+            key=x_t,
+            value=x_t,
+            key_padding_mask=key_padding_mask,
+        )
+
+        # Project to output dimension: (B, n_style, style_value_dim)
+        out = self.proj_out(out)
+
+        return out

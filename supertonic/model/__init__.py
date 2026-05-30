@@ -37,11 +37,13 @@ from .attention import (
     RoPECrossAttention,
     StyleCrossAttention,
     SpeechPromptedAttention,
+    StyleTokenLayer,
 )
 from .duration_predictor import DurationPredictor
 from .text_encoder import TextEncoder
 from .vector_field import VectorField
 from .vocoder import Vocoder
+from .encoder import AudioEncoder, MelSpectrogram
 from supertonic.core import Style, UnicodeProcessor
 from supertonic.loader import load_voice_style_from_json_file, load_voice_style_from_name
 from supertonic.utils import chunk_text as _chunk_text_util
@@ -60,11 +62,14 @@ __all__ = [
     "RoPECrossAttention",
     "StyleCrossAttention",
     "SpeechPromptedAttention",
+    "StyleTokenLayer",
     # Sub-models
     "DurationPredictor",
     "TextEncoder",
     "VectorField",
     "Vocoder",
+    "AudioEncoder",
+    "MelSpectrogram",
     # Full model
     "SupertonicModel",
     # Utilities
