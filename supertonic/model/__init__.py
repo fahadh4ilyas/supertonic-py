@@ -16,12 +16,14 @@ from __future__ import annotations
 import json
 import math
 import re
+import warnings
 from pathlib import Path
 from typing import Generator, Optional
 
 import numpy as np
 import safetensors.torch
 import torch
+import torchaudio
 import torch.nn as nn
 
 from .common import (
@@ -124,6 +126,7 @@ class SupertonicModel(nn.Module):
         self.text_encoder = TextEncoder(vocab_size=vocab_size, config=ttl)
         self.vector_field = VectorField(config=ttl.get("vector_field"))
         self.vocoder = Vocoder(config=ae.get("decoder"))
+        self.audio_encoder = AudioEncoder(config=config)
 
     def sample_noisy_latent(self, duration: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         bsz = duration.shape[0]
@@ -201,6 +204,74 @@ class SupertonicModel(nn.Module):
             return []
         return list_available_voice_style_names(self.model_dir)
 
+    # ── AudioEncoder support ─────────────────────────────────────────────
+
+    def load_encoder(self, checkpoint_path: str | Path) -> None:
+        """Load trained AudioEncoder weights from a checkpoint.
+
+        Args:
+            checkpoint_path: Path to a ``.pt`` checkpoint saved by
+                ``scripts/train_encoder.py``.
+        """
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        state = checkpoint.get("encoder", checkpoint)
+        self.audio_encoder.load_state_dict(state)
+        self.audio_encoder.eval()
+
+    def has_encoder(self) -> bool:
+        """Check if AudioEncoder has been trained (weights are not random)."""
+        # Heuristic: if the first Conv1d weight has non-trivial variance,
+        # the encoder has been trained. Random init has very low variance.
+        w = self.audio_encoder.proj_in.weight
+        return bool(w.var().item() > 1e-4)
+
+    def _load_voice_ref(self, voice_ref: str | Path | np.ndarray) -> Style:
+        """Convert a voice_ref (path or waveform) into a Style via the encoder.
+
+        Args:
+            voice_ref: Path to an audio file, or a numpy waveform array
+                of shape (samples,) or (1, samples) at 44100 Hz.
+
+        Returns:
+            Style object with extracted style_ttl and style_dp.
+        """
+        if not self.has_encoder():
+            raise RuntimeError(
+                "AudioEncoder has not been trained yet. "
+                "Train with scripts/train_encoder.py, then call load_encoder()."
+            )
+
+        device = next(self.parameters()).device
+
+        # Convert to waveform tensor (1, 1, T)
+        if isinstance(voice_ref, (str, Path)):
+            waveform, sr = torchaudio.load(str(voice_ref))
+            if sr != self.sample_rate:
+                resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
+                waveform = resampler(waveform)
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+        elif isinstance(voice_ref, np.ndarray):
+            waveform = torch.from_numpy(voice_ref.astype(np.float32))
+            if waveform.dim() == 1:
+                waveform = waveform.unsqueeze(0)
+            if waveform.dim() == 2:
+                waveform = waveform.unsqueeze(1)  # (B, 1, T)
+        else:
+            raise TypeError(f"voice_ref must be str, Path, or np.ndarray, got {type(voice_ref)}")
+
+        waveform = waveform.to(device)
+
+        with torch.no_grad():
+            style_ttl, style_dp = self.audio_encoder(waveform)
+
+        return Style(
+            style_ttl_onnx=style_ttl.cpu().numpy(),
+            style_dp_onnx=style_dp.cpu().numpy(),
+        )
+
+    # ── Synthesis ────────────────────────────────────────────────────────
+
     @torch.inference_mode()
     def synthesize(
         self,
@@ -211,12 +282,14 @@ class SupertonicModel(nn.Module):
         silence_duration: float = 0.3,
         max_chunk_length: Optional[int] = None,
         lang: Optional[str] = "na",
+        voice_ref: str | Path | np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Synthesize speech from text.
 
         Args:
             text: Text to synthesize.
             voice_style: Voice style object containing ttl and dp vectors.
+                Ignored if ``voice_ref`` is provided.
             total_steps: Number of diffusion steps (default: 8).
             speed: Speech speed multiplier (default: 1.05).
             silence_duration: Seconds of silence between chunks (default: 0.3).
@@ -224,12 +297,20 @@ class SupertonicModel(nn.Module):
                 (120 for Korean, 300 otherwise).
             lang: Language code. Default ``"na"`` for multilingual models.
                 Set to ``None`` for English-only models (v1).
+            voice_ref: Optional reference audio for voice cloning. Can be:
+                - str/Path: path to an audio file
+                - np.ndarray: waveform (samples,) or (1, samples) at 44100 Hz
+                Requires :meth:`load_encoder` to have been called first.
+                Overrides ``voice_style`` when provided.
 
         Returns:
             Tuple of (waveform, duration):
                 - waveform: float32 array of shape (1, num_samples)
                 - duration: Total duration in seconds
         """
+        if voice_ref is not None:
+            voice_style = self._load_voice_ref(voice_ref)
+
         if self.unicode_indexer is None:
             raise ValueError(
                 "unicode_indexer not set on model. Pass it to __init__ or "
@@ -291,12 +372,14 @@ class SupertonicModel(nn.Module):
         silence_duration: float = 0.3,
         max_chunk_length: Optional[int] = None,
         lang: Optional[str] = "na",
+        voice_ref: str | Path | np.ndarray | None = None,
     ) -> Generator[tuple[np.ndarray, np.ndarray], None, None]:
         """Synthesize speech from text, yielding audio chunks on the fly.
 
         Args:
             text: Text to synthesize.
             voice_style: Voice style object containing ttl and dp vectors.
+                Ignored if ``voice_ref`` is provided.
             total_steps: Number of diffusion steps (default: 8).
             speed: Speech speed multiplier (default: 1.05).
             silence_duration: Seconds of silence between chunks (default: 0.3).
@@ -304,10 +387,15 @@ class SupertonicModel(nn.Module):
                 (120 for Korean, 300 otherwise).
             lang: Language code. Default ``"na"`` for multilingual models.
                 Set to ``None`` for English-only models (v1).
+            voice_ref: Optional reference audio for voice cloning (see
+                :meth:`synthesize`). Overrides ``voice_style`` when provided.
 
         Yields:
             Tuple of (waveform, duration) for each processed chunk.
         """
+        if voice_ref is not None:
+            voice_style = self._load_voice_ref(voice_ref)
+
         if self.unicode_indexer is None:
             raise ValueError(
                 "unicode_indexer not set on model. Pass it to __init__ or "
@@ -420,6 +508,13 @@ class SupertonicModel(nn.Module):
         # Save unicode indexer if set
         if self.unicode_indexer is not None:
             shutil.copy(self.unicode_indexer, save_dir / "unicode_indexer.json")
+
+        # Copy voice styles if available
+        if self.model_dir is not None:
+            styles_src = self.model_dir / "voice_styles"
+            styles_dst = save_dir / "voice_styles"
+            if styles_src.is_dir() and not styles_dst.exists():
+                shutil.copytree(styles_src, styles_dst)
 
     def _build_config(self) -> dict:
         """Reconstruct a tts.json-compatible config from model architecture."""
@@ -546,6 +641,14 @@ class SupertonicModel(nn.Module):
         # Load weights
         state = safetensors.torch.load_file(str(model_dir / "model.safetensors"))
         model.load_state_dict(state, strict=False)
+
+        # Warn if AudioEncoder hasn't been trained yet
+        if not model.has_encoder():
+            warnings.warn(
+                "AudioEncoder has not been trained yet. "
+                "Voice cloning (voice_ref) is disabled until you train with "
+                "scripts/train_encoder.py and call model.load_encoder()."
+            )
 
         if device is not None:
             model = model.to(device)
