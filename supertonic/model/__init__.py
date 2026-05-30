@@ -45,7 +45,7 @@ from .vector_field import VectorField
 from .vocoder import Vocoder
 from .encoder import AudioEncoder, MelSpectrogram
 from supertonic.core import Style, UnicodeProcessor
-from supertonic.loader import load_voice_style_from_json_file, load_voice_style_from_name
+from supertonic.loader import load_voice_style_from_json_file, load_voice_style_from_name, list_available_voice_style_names
 from supertonic.utils import chunk_text as _chunk_text_util
 
 
@@ -193,6 +193,13 @@ class SupertonicModel(nn.Module):
             Style object containing voice style vectors.
         """
         return load_voice_style_from_json_file(voice_style_path)
+
+    @property
+    def voice_style_names(self) -> list[str]:
+        """List available built-in voice style names (e.g. M1-M5, F1-F5)."""
+        if self.model_dir is None:
+            return []
+        return list_available_voice_style_names(self.model_dir)
 
     @torch.inference_mode()
     def synthesize(

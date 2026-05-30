@@ -117,6 +117,8 @@ class ServerState:
     __slots__ = (
         "model",
         "tts",
+        "use_onnx",
+        "device",
         "custom_styles",
         "custom_styles_dir",
         "synth_lock",
@@ -128,11 +130,15 @@ class ServerState:
         model: str = DEFAULT_MODEL,
         *,
         tts: Optional["TTS"] = None,
+        use_onnx: bool = True,
+        device: Optional[str] = None,
         custom_styles_dir: Optional[Path] = None,
         custom_styles: Optional[Dict[str, Path]] = None,
     ) -> None:
         self.model = model
         self.tts = tts
+        self.use_onnx = use_onnx
+        self.device = device
         # Custom styles default to the *model's* cache dir, so the same name
         # cannot collide across model versions.
         self.custom_styles_dir = (
@@ -149,6 +155,8 @@ def create_app(
     *,
     state: Optional[ServerState] = None,
     model: str = DEFAULT_MODEL,
+    use_onnx: bool = True,
+    device: Optional[str] = None,
     custom_styles_dir: Optional[Path] = None,
     cors_origins: Optional[Iterable[str]] = None,
 ) -> FastAPI:
@@ -159,6 +167,10 @@ def create_app(
             instantiate :class:`supertonic.TTS` — useful for tests that inject
             a fake. Pass ``None`` for normal use.
         model: Model name to load if ``state.tts`` is ``None``.
+        use_onnx: If True (default), use ONNX runtime via :class:`supertonic.TTS`.
+            If False, use PyTorch :class:`supertonic.model.SupertonicModel`.
+        device: Torch device for PyTorch backend (e.g. ``"cuda"``, ``"cpu"``).
+            Only used when ``use_onnx=False``. Default ``None`` keeps on CPU.
         custom_styles_dir: Override the on-disk location of user-imported
             voice styles. Defaults to
             :func:`supertonic.server.styles_store.default_custom_styles_dir`.
@@ -167,19 +179,27 @@ def create_app(
             curl do not.
     """
     if state is None:
-        state = ServerState(model=model, custom_styles_dir=custom_styles_dir)
+        state = ServerState(model=model, custom_styles_dir=custom_styles_dir,
+                            use_onnx=use_onnx, device=device)
     elif custom_styles_dir is not None:
         state.custom_styles_dir = Path(custom_styles_dir)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         if state.tts is None:
-            # Import here so that ``supertonic.server`` import does not pull
-            # the model loader into hot paths or test harnesses that mock it.
-            from ..pipeline import TTS
-
-            logger.info("Loading TTS model %r ...", state.model)
-            state.tts = TTS(model=state.model)
+            if state.use_onnx:
+                from ..pipeline import TTS
+                logger.info("Loading TTS model %r (ONNX)...", state.model)
+                state.tts = TTS(model=state.model)
+            else:
+                from ..model import SupertonicModel
+                from ..loader import get_cache_dir
+                logger.info("Loading TTS model %r (PyTorch, device=%s)...",
+                            state.model, state.device or "cpu")
+                model_dir = get_cache_dir(state.model)
+                state.tts = SupertonicModel.from_pretrained(
+                    str(model_dir), device=state.device,
+                )
         state.custom_styles = styles_store.scan(state.custom_styles_dir)
         state.is_ready = True
         logger.info(

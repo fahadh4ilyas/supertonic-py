@@ -261,7 +261,8 @@ def cmd_serve(args):
     if args.cors:
         cors_origins = [o.strip() for o in args.cors.split(",") if o.strip()]
 
-    app = create_app(model=args.model, cors_origins=cors_origins)
+    app = create_app(model=args.model, use_onnx=args.use_onnx, device=args.device,
+                     cors_origins=cors_origins)
 
     print(f"supertonic serve listening on http://{args.host}:{args.port}")
     print(f"  docs:  http://{args.host}:{args.port}/docs")
@@ -525,6 +526,24 @@ Examples:
         default="info",
         choices=["critical", "error", "warning", "info", "debug", "trace"],
         help="uvicorn log level (default: info)",
+    )
+    parser_serve.add_argument(
+        "--use-onnx",
+        action="store_true",
+        default=True,
+        help="Use ONNX runtime (default: True). Use --no-use-onnx for PyTorch.",
+    )
+    parser_serve.add_argument(
+        "--no-use-onnx",
+        action="store_false",
+        dest="use_onnx",
+        help="Use PyTorch SupertonicModel instead of ONNX runtime.",
+    )
+    parser_serve.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Torch device for PyTorch backend (e.g. 'cuda', 'cpu'). Only used with --no-use-onnx.",
     )
     add_common_args(parser_serve)
     parser_serve.set_defaults(func=cmd_serve)
