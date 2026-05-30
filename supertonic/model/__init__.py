@@ -241,28 +241,32 @@ class SupertonicModel(nn.Module):
         if max_chunk_length is None:
             max_chunk_length = 120 if lang == "ko" else 300
 
+        device = next(self.parameters()).device
         text_processor = UnicodeProcessor(str(self.unicode_indexer))
 
-        # Chunk text for processing
-        text_chunks = self._chunk_text(text, max_chunk_length)
+        # Preprocess once (unicode norm, language tokens, etc.) then chunk.
+        # Matches ONNX pipeline: language tokens wrap the full text once.
+        pp_text = text_processor._preprocess_text(text, lang)
+        text_chunks = self._chunk_text(pp_text, max_chunk_length)
         silence_samples = int(silence_duration * self.sample_rate)
 
         wav_list = []
         dur_list = []
 
         for text_chunk in text_chunks:
-            text_ids_np, text_mask_np = text_processor([text_chunk], lang)
+            # Tokenize each chunk (no further lang wrapping — already done)
+            text_ids_np, text_mask_np = text_processor([text_chunk], None)
 
             wav_t, dur_t = self.forward(
-                text_ids=torch.from_numpy(text_ids_np),
-                style_ttl=torch.from_numpy(voice_style.ttl),
-                style_dp=torch.from_numpy(voice_style.dp),
-                text_mask=torch.from_numpy(text_mask_np),
+                text_ids=torch.from_numpy(text_ids_np).to(device),
+                style_ttl=torch.from_numpy(voice_style.ttl).to(device),
+                style_dp=torch.from_numpy(voice_style.dp).to(device),
+                text_mask=torch.from_numpy(text_mask_np).to(device),
                 total_steps=total_steps,
                 speed=speed,
             )
-            wav_list.append(wav_t.numpy())
-            dur_list.append(dur_t.numpy().item())
+            wav_list.append(wav_t.cpu().numpy())
+            dur_list.append(dur_t.cpu().numpy().item())
 
         # Concatenate with silence between chunks
         silence = np.zeros((1, silence_samples), dtype=np.float32)
@@ -315,8 +319,12 @@ class SupertonicModel(nn.Module):
         if max_chunk_length is None:
             max_chunk_length = 120 if lang == "ko" else 300
 
+        device = next(self.parameters()).device
         text_processor = UnicodeProcessor(str(self.unicode_indexer))
-        text_chunks = self._chunk_text(text, max_chunk_length)
+
+        # Preprocess once, then chunk (matches ONNX pipeline)
+        pp_text = text_processor._preprocess_text(text, lang)
+        text_chunks = self._chunk_text(pp_text, max_chunk_length)
 
         silence_wav = None
         silence_wav_half = None
@@ -325,18 +333,19 @@ class SupertonicModel(nn.Module):
             silence_wav_half = np.zeros((1, int(silence_duration * self.sample_rate / 2.0)), dtype=np.float32)
 
         for i, text_chunk in enumerate(text_chunks):
-            text_ids_np, text_mask_np = text_processor([text_chunk], lang)
+            # Tokenize each chunk (no further lang wrapping)
+            text_ids_np, text_mask_np = text_processor([text_chunk], None)
 
             wav_t, dur_t = self.forward(
-                text_ids=torch.from_numpy(text_ids_np),
-                style_ttl=torch.from_numpy(voice_style.ttl),
-                style_dp=torch.from_numpy(voice_style.dp),
-                text_mask=torch.from_numpy(text_mask_np),
+                text_ids=torch.from_numpy(text_ids_np).to(device),
+                style_ttl=torch.from_numpy(voice_style.ttl).to(device),
+                style_dp=torch.from_numpy(voice_style.dp).to(device),
+                text_mask=torch.from_numpy(text_mask_np).to(device),
                 total_steps=total_steps,
                 speed=speed,
             )
-            wav = wav_t.numpy()
-            dur = dur_t.numpy()
+            wav = wav_t.cpu().numpy()
+            dur = dur_t.cpu().numpy()
 
             # Trim leading/trailing silence from the waveform
             audio = wav[0]
