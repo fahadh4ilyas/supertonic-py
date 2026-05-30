@@ -549,7 +549,7 @@ def register_routes(app: FastAPI) -> None:
                             voice_style=style,
                             lang=mapped_lang,
                             speed=config.get("speed", 1.0),
-                            max_chunk_length=config.get("max_chunk_length", None),
+                            max_chunk_length=config.get("max_chunk_length"),
                             silence_duration=config.get("silence_duration", DEFAULT_SILENCE_DURATION),
                         )
 

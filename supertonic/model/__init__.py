@@ -209,7 +209,7 @@ class SupertonicModel(nn.Module):
         total_steps: int = 8,
         speed: float = 1.05,
         silence_duration: float = 0.3,
-        max_chunk_length: int = 300,
+        max_chunk_length: Optional[int] = None,
         lang: Optional[str] = "na",
     ) -> tuple[np.ndarray, np.ndarray]:
         """Synthesize speech from text.
@@ -220,7 +220,8 @@ class SupertonicModel(nn.Module):
             total_steps: Number of diffusion steps (default: 8).
             speed: Speech speed multiplier (default: 1.05).
             silence_duration: Seconds of silence between chunks (default: 0.3).
-            max_chunk_length: Max characters per chunk (default: 300).
+            max_chunk_length: Max characters per chunk. If None, auto-detected
+                (120 for Korean, 300 otherwise).
             lang: Language code. Default ``"na"`` for multilingual models.
                 Set to ``None`` for English-only models (v1).
 
@@ -236,6 +237,9 @@ class SupertonicModel(nn.Module):
             )
         if not text or not text.strip():
             raise ValueError("Text cannot be empty")
+
+        if max_chunk_length is None:
+            max_chunk_length = 120 if lang == "ko" else 300
 
         text_processor = UnicodeProcessor(str(self.unicode_indexer))
 
@@ -281,7 +285,7 @@ class SupertonicModel(nn.Module):
         total_steps: int = 8,
         speed: float = 1.05,
         silence_duration: float = 0.3,
-        max_chunk_length: int = 300,
+        max_chunk_length: Optional[int] = None,
         lang: Optional[str] = "na",
     ) -> Generator[tuple[np.ndarray, np.ndarray], None, None]:
         """Synthesize speech from text, yielding audio chunks on the fly.
@@ -292,7 +296,8 @@ class SupertonicModel(nn.Module):
             total_steps: Number of diffusion steps (default: 8).
             speed: Speech speed multiplier (default: 1.05).
             silence_duration: Seconds of silence between chunks (default: 0.3).
-            max_chunk_length: Max characters per chunk (default: 300).
+            max_chunk_length: Max characters per chunk. If None, auto-detected
+                (120 for Korean, 300 otherwise).
             lang: Language code. Default ``"na"`` for multilingual models.
                 Set to ``None`` for English-only models (v1).
 
@@ -306,6 +311,9 @@ class SupertonicModel(nn.Module):
             )
         if not text or not text.strip():
             raise ValueError("Text cannot be empty")
+
+        if max_chunk_length is None:
+            max_chunk_length = 120 if lang == "ko" else 300
 
         text_processor = UnicodeProcessor(str(self.unicode_indexer))
         text_chunks = self._chunk_text(text, max_chunk_length)
