@@ -505,11 +505,14 @@ class SupertonicModel(nn.Module):
                 state[k] = state[k].contiguous()
         safetensors.torch.save_file(state, str(save_dir / "model.safetensors"))
 
-        # Save unicode indexer if set
+        # Save unicode indexer if set (skip if same path)
         if self.unicode_indexer is not None:
-            shutil.copy(self.unicode_indexer, save_dir / "unicode_indexer.json")
+            dst = save_dir / "unicode_indexer.json"
+            src = Path(self.unicode_indexer).resolve()
+            if dst.resolve() != src:
+                shutil.copy(src, dst)
 
-        # Copy voice styles if available
+        # Copy voice styles if available (skip if same path)
         if self.model_dir is not None:
             styles_src = self.model_dir / "voice_styles"
             styles_dst = save_dir / "voice_styles"
