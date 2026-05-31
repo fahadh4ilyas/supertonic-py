@@ -195,7 +195,7 @@ def register_routes(app: FastAPI) -> None:
             model=state.model,
             sample_rate=state.tts.sample_rate,
             version=__version__,
-            voices_loaded=len(state.tts.voice_style_names) + len(state.custom_styles),
+            voices_loaded=len(state.tts.voice_style_names) + len(state.custom_styles) + len(voice_manager.list_voices(get_custom_voices_dir())),
         )
 
     @router.get("/v1/styles", response_model=StylesResponse)
