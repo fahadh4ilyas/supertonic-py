@@ -37,7 +37,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from supertonic.model import SupertonicModel, AudioEncoder
+from supertonic.model import SupertonicModel, AudioEncoder, MelSpectrogram
 from supertonic.core import UnicodeProcessor
 from supertonic.loader import (
     load_voice_style_from_json_file,
@@ -191,8 +191,24 @@ class EncoderDataset(Dataset):
                 if not line:
                     continue
                 sample = json.loads(line)
-                if "text_encoder" not in sample or "text_tts" not in sample:
+                # text_encoder is required; text_tts defaults to text_encoder
+                if "text_encoder" not in sample:
                     continue
+                if "text_tts" not in sample:
+                    sample["text_tts"] = sample["text_encoder"]
+                # Resolve voice paths relative to dataset location
+                if "voice_encoder" in sample:
+                    sample["_voice_enc_path"] = str(
+                        self.jsonl_path.parent / sample["voice_encoder"]
+                    )
+                else:
+                    sample["_voice_enc_path"] = None
+                if "voice_tts" in sample:
+                    sample["_voice_tts_path"] = str(
+                        self.jsonl_path.parent / sample["voice_tts"]
+                    )
+                else:
+                    sample["_voice_tts_path"] = None
                 self.samples.append(sample)
 
         if not self.samples:
@@ -227,6 +243,10 @@ class EncoderDataset(Dataset):
         short_texts: list[dict] = []
 
         for sample in self.samples:
+            # Real audio samples don't need text length filtering
+            if sample.get("_voice_enc_path") is not None:
+                prepared.append(sample)
+                continue
             text_len = len(sample["text_encoder"])
             if text_len >= self.min_chars:
                 # Good length — use as-is, truncate if too long
@@ -291,7 +311,7 @@ class EncoderDataset(Dataset):
 
 
 def collate_fn(batch: list[dict]) -> dict:
-    """Collate a batch — includes pre-tokenized arrays via np.stack."""
+    """Collate a batch — includes pre-tokenized arrays and voice_ref paths."""
     return {
         "text_encoder": [s["text_encoder"] for s in batch],
         "text_tts": [s["text_tts"] for s in batch],
@@ -300,6 +320,8 @@ def collate_fn(batch: list[dict]) -> dict:
         "_enc_mask": np.stack([s["_enc_mask"] for s in batch]),
         "_tts_ids": np.stack([s["_tts_ids"] for s in batch]),
         "_tts_mask": np.stack([s["_tts_mask"] for s in batch]),
+        "_voice_enc_path": [s["_voice_enc_path"] for s in batch],
+        "_voice_tts_path": [s["_voice_tts_path"] for s in batch],
     }
 
 
@@ -375,6 +397,94 @@ def generate_audio(
             wav = wav[:, start:end]
 
     return wav
+
+
+def _load_real_audio(path: str, target_sr: int, device: torch.device) -> torch.Tensor | None:
+    """Load a real audio file, resample if needed, return as (1, T) tensor on device."""
+    try:
+        import torchaudio
+        waveform, sr = torchaudio.load(path)
+        if sr != target_sr:
+            waveform = torchaudio.transforms.Resample(sr, target_sr)(waveform)
+    except ImportError:
+        import soundfile as sf
+        import scipy.signal
+        wav_np, sr = sf.read(path)
+        if wav_np.ndim > 1:
+            wav_np = wav_np.mean(axis=1)
+        if sr != target_sr:
+            num_samples = int(len(wav_np) * target_sr / sr)
+            wav_np = scipy.signal.resample(wav_np, num_samples)
+        waveform = torch.from_numpy(wav_np.astype(np.float32)).unsqueeze(0)
+    except Exception:
+        return None
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+    # Trim silence
+    wav_np = waveform.numpy()[0]
+    active = np.where(np.abs(wav_np) > 0.002)[0]
+    if len(active) > 0:
+        margin = int(target_sr * 0.02)
+        start = max(0, active[0] - margin)
+        end = min(len(wav_np), active[-1] + margin)
+        waveform = waveform[:, start:end]
+    return waveform.to(device)
+
+
+# Shared mel-spectrogram extractor for TTS-through loss (created once)
+_mel_extractor: MelSpectrogram | None = None
+
+
+def _get_mel(tts_model: SupertonicModel, device: torch.device) -> MelSpectrogram:
+    """Get or create a shared MelSpectrogram matching the TTS model's audio config."""
+    global _mel_extractor
+    if _mel_extractor is None:
+        spec = tts_model.config.get("ae", {}).get("encoder", {}).get("spec_processor", {})
+        _mel_extractor = MelSpectrogram(
+            sample_rate=spec.get("sample_rate", tts_model.sample_rate),
+            n_fft=spec.get("n_fft", 2048),
+            win_length=spec.get("win_length", 2048),
+            hop_length=spec.get("hop_length", 512),
+            n_mels=spec.get("n_mels", 228),
+        ).to(device)
+    return _mel_extractor
+
+
+def tts_through_loss(
+    tts_model: SupertonicModel,
+    text_ids_np: np.ndarray,
+    text_mask_np: np.ndarray,
+    style_ttl_pred: torch.Tensor,
+    style_dp_pred: torch.Tensor,
+    target_wav: torch.Tensor,
+    total_steps: int = 4,
+    speed: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """TTS-through reconstruction loss: generate audio from predicted style,
+    compare mel-spectrograms with the target audio."""
+    device = style_ttl_pred.device
+    text_ids = torch.from_numpy(text_ids_np).to(device)
+    text_mask = torch.from_numpy(text_mask_np).to(device)
+
+    dur_pred = tts_model.duration_predictor(text_ids, style_dp_pred, text_mask)
+    dur_actual = target_wav.shape[-1] / tts_model.sample_rate
+    dur_loss = F.smooth_l1_loss(
+        torch.log(dur_pred.clamp(min=1e-6)),
+        torch.log(torch.tensor(dur_actual, device=device).clamp(min=1e-6)),
+    )
+
+    wav_pred, _ = tts_model.forward(
+        text_ids=text_ids, style_ttl=style_ttl_pred, style_dp=style_dp_pred,
+        text_mask=text_mask, total_steps=total_steps, speed=speed,
+    )
+
+    mel = _get_mel(tts_model, device)
+    mel_pred = mel(wav_pred)
+    mel_target = mel(target_wav.unsqueeze(0))
+    min_len = min(mel_pred.shape[-1], mel_target.shape[-1])
+    mel_loss = F.mse_loss(mel_pred[..., :min_len], mel_target[..., :min_len])
+
+    return mel_loss, dur_loss
 
 
 def text_encoder_loss(
@@ -575,6 +685,7 @@ def main():
         epoch_start = time.time()
         epoch_metrics = defaultdict(float)
         epoch_steps = 0
+        epoch_synth_steps = 0  # only synthetic samples (for text/dur metrics)
         epoch_samples_skipped = 0
 
         # Shuffle and create dataloader
@@ -608,13 +719,23 @@ def main():
                 enc_mask = batch["_enc_mask"][i]
                 tts_ids = batch["_tts_ids"][i]
                 tts_mask = batch["_tts_mask"][i]
+                voice_enc_path = batch["_voice_enc_path"][i]
+                voice_tts_path = batch["_voice_tts_path"][i]
 
-                # Step 1: Generate reference audio from pre-tokenized text + true style
-                audio = generate_audio(
-                    tts_model, enc_ids, enc_mask,
-                    style_ttl_true, style_dp_true,
-                    total_steps=args.total_steps, speed=args.speed,
-                )
+                # Step 1: Get reference audio
+                if voice_enc_path is not None:
+                    # Real audio: encoder input
+                    audio = _load_real_audio(voice_enc_path, tts_model.sample_rate, device)
+                    if audio is None:
+                        epoch_samples_skipped += 1
+                        continue
+                else:
+                    # Synthetic: generate from text + random style
+                    audio = generate_audio(
+                        tts_model, enc_ids, enc_mask,
+                        style_ttl_true, style_dp_true,
+                        total_steps=args.total_steps, speed=args.speed,
+                    )
                 if audio is None:
                     epoch_samples_skipped += 1
                     continue
@@ -629,16 +750,32 @@ def main():
                     style_ttl_pred, style_dp_pred = encoder(audio.unsqueeze(0))
 
                 # Step 3: Compute losses
-                loss_style_ttl = F.mse_loss(style_ttl_pred, style_ttl_true)
-                loss_style_dp = F.mse_loss(style_dp_pred, style_dp_true)
-                loss_style = loss_style_ttl + loss_style_dp
+                if voice_enc_path is not None and voice_tts_path is not None:
+                    # Real audio: TTS-through reconstruction loss
+                    audio_tts = _load_real_audio(voice_tts_path, tts_model.sample_rate, device)
+                    if audio_tts is None:
+                        epoch_samples_skipped += 1
+                        continue
+                    loss_mel, loss_dur = tts_through_loss(
+                        tts_model, tts_ids, tts_mask,
+                        style_ttl_pred, style_dp_pred, audio_tts,
+                        total_steps=args.total_steps, speed=args.speed,
+                    )
+                    loss = loss_mel + loss_dur
+                    epoch_metrics["loss_style"] += loss.item()
+                    epoch_metrics["loss_style_ttl"] += loss_mel.item()
+                    epoch_metrics["loss_style_dp"] += loss_dur.item()
+                else:
+                    # Synthetic audio: MSE against known style vectors
+                    loss_ttl = F.mse_loss(style_ttl_pred, style_ttl_true)
+                    loss_dp = F.mse_loss(style_dp_pred, style_dp_true)
+                    loss = loss_ttl + loss_dp
+                    epoch_metrics["loss_style"] += loss.item()
+                    epoch_metrics["loss_style_ttl"] += loss_ttl.item()
+                    epoch_metrics["loss_style_dp"] += loss_dp.item()
+                    epoch_synth_steps += 1
 
-                loss = loss_style
-                epoch_metrics["loss_style"] += loss_style.item()
-                epoch_metrics["loss_style_ttl"] += loss_style_ttl.item()
-                epoch_metrics["loss_style_dp"] += loss_style_dp.item()
-
-                if args.lambda_text > 0 and tts_ids is not None:
+                if args.lambda_text > 0 and tts_ids is not None and voice_enc_path is None:
                     with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                         loss_text = text_encoder_loss(
                             tts_model, tts_ids, tts_mask,
@@ -647,7 +784,7 @@ def main():
                     loss = loss + args.lambda_text * loss_text
                     epoch_metrics["loss_text"] += loss_text.item()
 
-                if args.lambda_dur > 0 and tts_ids is not None:
+                if args.lambda_dur > 0 and tts_ids is not None and voice_enc_path is None:
                     with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                         loss_dur = duration_predictor_loss(
                             tts_model, tts_ids, tts_mask,
@@ -683,12 +820,13 @@ def main():
                 # Update batch progress bar (throttled: every 4 gradient steps)
                 if global_step % 4 == 0:
                     denom = max(epoch_steps, 1)
+                    synth_denom = max(epoch_synth_steps, 1)
                     batch_pbar.set_postfix({
                         "loss": f"{epoch_metrics['loss_style'] / denom:.4f}",
                         "ttl": f"{epoch_metrics['loss_style_ttl'] / denom:.4f}",
                         "dp": f"{epoch_metrics['loss_style_dp'] / denom:.4f}",
-                        **({"text": f"{epoch_metrics['loss_text'] / denom:.4f}"} if args.lambda_text > 0 else {}),
-                        **({"dur": f"{epoch_metrics['loss_dur'] / denom:.4f}"} if args.lambda_dur > 0 else {}),
+                        **({"text": f"{epoch_metrics['loss_text'] / synth_denom:.4f}"} if args.lambda_text > 0 else {}),
+                        **({"dur": f"{epoch_metrics['loss_dur'] / synth_denom:.4f}"} if args.lambda_dur > 0 else {}),
                         "skip": epoch_samples_skipped,
                     }, refresh=False)
 
@@ -699,6 +837,7 @@ def main():
         # ── Epoch summary ────────────────────────────────────────────────────
         epoch_time = time.time() - epoch_start
         denom = max(epoch_steps, 1)
+        synth_denom = max(epoch_synth_steps, 1)
         avg_style = epoch_metrics["loss_style"] / denom
 
         epoch_pbar.set_postfix({
@@ -717,9 +856,9 @@ def main():
                 f"Style: {avg_style:.6f} | "
                 f"TTL: {epoch_metrics['loss_style_ttl'] / denom:.6f} | "
                 f"DP: {epoch_metrics['loss_style_dp'] / denom:.6f}"
-                + (f" | Text: {epoch_metrics['loss_text'] / denom:.6f}"
+                + (f" | Text: {epoch_metrics['loss_text'] / synth_denom:.6f}"
                    if args.lambda_text > 0 else "")
-                + (f" | Dur: {epoch_metrics['loss_dur'] / denom:.6f}"
+                + (f" | Dur: {epoch_metrics['loss_dur'] / synth_denom:.6f}"
                    if args.lambda_dur > 0 else "")
                 + f" | Skipped: {epoch_samples_skipped}"
             )

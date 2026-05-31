@@ -113,6 +113,7 @@ class SupertonicModel(nn.Module):
         if config is None:
             config = {}
 
+        self.config = config
         ae = config.get("ae", {})
         ttl = config.get("ttl", {})
         dp_cfg = config.get("dp", {})
@@ -520,99 +521,8 @@ class SupertonicModel(nn.Module):
                 shutil.copytree(styles_src, styles_dst)
 
     def _build_config(self) -> dict:
-        """Reconstruct a tts.json-compatible config from model architecture."""
-        return {
-            "ae": {
-                "sample_rate": self.sample_rate,
-                "base_chunk_size": self.base_chunk_size,
-                "decoder": {
-                    "num_layers": 10,
-                    "dilation_lst": [1, 2, 4, 1, 2, 4, 1, 1, 1, 1],
-                    "intermediate_dim": 2048,
-                    "idim": 24,
-                    "hdim": 512,
-                    "ksz": 7,
-                    "head": {"idim": 512, "hdim": 2048, "odim": 512, "ksz": 3},
-                },
-            },
-            "ttl": {
-                "latent_dim": self.ldim,
-                "chunk_compress_factor": self.chunk_compress_factor,
-                "normalizer": {"scale": 0.25},
-                "text_encoder": {
-                    "text_embedder": {"char_emb_dim": 256},
-                    "convnext": {
-                        "idim": 256, "ksz": 5, "intermediate_dim": 1024,
-                        "num_layers": 6, "dilation_lst": [1, 1, 2, 2, 4, 4],
-                    },
-                    "attn_encoder": {
-                        "hidden_channels": 256, "filter_channels": 1024,
-                        "n_heads": 4, "n_layers": 4,
-                    },
-                },
-                "style_encoder": {
-                    "style_token_layer": {
-                        "n_style": 50,
-                        "style_value_dim": 256,
-                    },
-                },
-                "speech_prompted_text_encoder": {
-                    "text_dim": 256, "style_dim": 256,
-                    "n_units": 256, "n_heads": 2,
-                },
-                "vector_field": {
-                    "proj_in": {"ldim": 24, "chunk_compress_factor": 6, "odim": 512},
-                    "time_encoder": {"time_dim": 64, "hdim": 256},
-                    "main_blocks": {
-                        "n_blocks": 4,
-                        "text_cond_layer": {
-                            "idim": 512, "text_dim": 256,
-                            "n_heads": 8, "n_units": 512,
-                        },
-                        "style_cond_layer": {"idim": 512, "style_dim": 256},
-                        "convnext_0": {
-                            "idim": 512, "ksz": 5, "intermediate_dim": 2048,
-                            "num_layers": 4, "dilation_lst": [1, 2, 4, 8],
-                        },
-                        "convnext_1": {
-                            "idim": 512, "ksz": 5, "intermediate_dim": 2048,
-                            "num_layers": 1, "dilation_lst": [1],
-                        },
-                        "convnext_2": {
-                            "idim": 512, "ksz": 5, "intermediate_dim": 2048,
-                            "num_layers": 1, "dilation_lst": [1],
-                        },
-                    },
-                    "last_convnext": {
-                        "idim": 512, "ksz": 5, "intermediate_dim": 2048,
-                        "num_layers": 4, "dilation_lst": [1, 1, 1, 1],
-                    },
-                    "proj_out": {"idim": 512, "chunk_compress_factor": 6, "ldim": 24},
-                },
-            },
-            "dp": {
-                "sentence_encoder": {
-                    "char_emb_dim": 64,
-                    "convnext": {
-                        "idim": 64, "ksz": 5, "intermediate_dim": 256,
-                        "num_layers": 6, "dilation_lst": [1, 1, 1, 1, 1, 1],
-                    },
-                    "attn_encoder": {
-                        "hidden_channels": 64, "filter_channels": 256,
-                        "n_heads": 2, "n_layers": 2,
-                    },
-                },
-                "style_encoder": {
-                    "style_token_layer": {
-                        "n_style": 8,
-                        "style_value_dim": 16,
-                    },
-                },
-                "predictor": {
-                    "hdim": 128, "n_layer": 2,
-                },
-            },
-        }
+        """Stored config from tts.json."""
+        return self.config
 
     @classmethod
     def from_pretrained(
