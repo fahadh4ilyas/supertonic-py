@@ -22,7 +22,7 @@ from fastapi import FastAPI
 from .. import __version__
 from ..config import DEFAULT_MODEL
 from . import styles_store
-from .routes import MAX_STYLE_IMPORT_BYTES, register_routes
+from .routes import MAX_STYLE_IMPORT_BYTES, register_routes, include_voice_routes
 from .schemas import ErrorDetail, ErrorEnvelope
 
 if TYPE_CHECKING:
@@ -243,4 +243,9 @@ def create_app(
     app.add_middleware(StyleImportSizeLimit, max_bytes=MAX_STYLE_IMPORT_BYTES)
 
     register_routes(app)
+
+    # Voice management (POST/DELETE /v1/audio/voices) — PyTorch backend only
+    if not use_onnx:
+        include_voice_routes(app)
+
     return app
