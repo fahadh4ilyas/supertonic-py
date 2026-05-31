@@ -115,10 +115,10 @@ def generate_from_wikipedia(
     token: str | None = None,
     validator: "UnicodeProcessor | None" = None,
 ) -> None:
-    """Generate dataset from Wikipedia dumps.
+    """Generate dataset from Wikipedia via wikimedia/wikipedia.
 
-    Uses the HuggingFace 'wikipedia' dataset which has snapshots for
-    many languages. Downloads are typically 10-500 MB per language.
+    Uses the HuggingFace ``wikimedia/wikipedia`` dataset (Parquet-based,
+    no deprecated loading scripts). Millions of articles per language.
     """
     from datasets import load_dataset
 
@@ -138,7 +138,7 @@ def generate_from_wikipedia(
         try:
             print(f"  Loading Wikipedia ({lang_st})...", end=" ", flush=True)
             dataset = load_dataset(
-                "wikipedia",
+                "wikimedia/wikipedia",
                 f"20231101.{lang_wiki}",
                 split="train",
                 token=token,
@@ -152,43 +152,53 @@ def generate_from_wikipedia(
         lang_samples = 0
         target_per_lang = max(20, num_samples // len(lang_items))
 
-        for article in dataset:
-            if lang_samples >= target_per_lang:
-                break
+        # Randomly sample articles instead of iterating sequentially
+        n_articles = len(dataset)
+        indices = list(range(n_articles))
+        random.shuffle(indices)
+        indices = indices[: min(n_articles, target_per_lang * 10)]  # search up to 10× needed
 
+        # Collect all valid paragraphs from sampled articles
+        lang_paragraphs = []
+        for idx in indices:
+            article = dataset[idx]
             text = article.get("text", "")
             if not text:
                 continue
-
-            # Split into paragraphs, filter by length
-            paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
-            for para in paragraphs:
+            for para in text.split("\n"):
                 para = para.strip()
                 if not (min_chars <= len(para) <= max_chars):
                     continue
-                # Validate against model's character set
                 if validator is not None and not is_text_valid(para, lang_st, validator):
                     continue
-                # Create a shorter version for text_tts from the same paragraph
-                sentences = para.split(". ")
-                if len(sentences) >= 2:
-                    tts_text = ". ".join(sentences[:2]).strip() + "."
-                else:
-                    tts_text = para
-
-                all_paragraphs.append({
-                    "text_encoder": para,
-                    "text_tts": tts_text,
-                    "lang": lang_st,
-                })
-                lang_samples += 1
-                samples_written += 1
-
-                if samples_written >= num_samples:
+                lang_paragraphs.append(para)
+                if len(lang_paragraphs) >= target_per_lang * 2:
                     break
+            if len(lang_paragraphs) >= target_per_lang * 2:
+                break
 
+        # Pair paragraphs: text_encoder and text_tts come from different articles
+        random.shuffle(lang_paragraphs)
+        for i in range(0, len(lang_paragraphs) - 1, 2):
+            enc = lang_paragraphs[i]
+            tts = lang_paragraphs[i + 1]
+            # Use first 2 sentences of tts paragraph as the short text
+            tts_sentences = tts.split(". ")
+            tts_short = ". ".join(tts_sentences[:2]).strip()
+            if tts_short and not tts_short.endswith("."):
+                tts_short += "."
+            all_paragraphs.append({
+                "text_encoder": enc,
+                "text_tts": tts_short or tts,
+                "lang": lang_st,
+            })
+            lang_samples += 1
+            samples_written += 1
             if samples_written >= num_samples:
                 break
+
+        if samples_written >= num_samples:
+            break
 
         print(f"    → {lang_samples} paragraphs")
 
