@@ -105,6 +105,7 @@ class SupertonicModel(nn.Module):
 
         self.unicode_indexer: Path | None = Path(unicode_indexer) if unicode_indexer is not None else None
         self.model_dir: Path | None = Path(model_dir) if model_dir is not None else None
+        self._text_processor: UnicodeProcessor | None = None
 
         # Resolve config
         if isinstance(config, (str, Path)):
@@ -145,6 +146,18 @@ class SupertonicModel(nn.Module):
         latent_mask = (ids < latent_lengths.unsqueeze(1)).float().unsqueeze(1)
         noisy_latent = noisy_latent * latent_mask
         return noisy_latent, latent_mask
+
+    @property
+    def text_processor(self) -> UnicodeProcessor:
+        """Lazily-initialized :class:`UnicodeProcessor` for the model's unicode indexer."""
+        if self._text_processor is None:
+            if self.unicode_indexer is None:
+                raise ValueError(
+                    "unicode_indexer not set on model. Pass it to __init__ or "
+                    "set model.unicode_indexer to a path to unicode_indexer.json."
+                )
+            self._text_processor = UnicodeProcessor(str(self.unicode_indexer))
+        return self._text_processor
 
     def forward(
         self,
@@ -324,11 +337,10 @@ class SupertonicModel(nn.Module):
             max_chunk_length = 120 if lang == "ko" else 300
 
         device = next(self.parameters()).device
-        text_processor = UnicodeProcessor(str(self.unicode_indexer))
 
         # Preprocess once (unicode norm, language tokens, etc.) then chunk.
         # Matches ONNX pipeline: language tokens wrap the full text once.
-        pp_text = text_processor._preprocess_text(text, lang)
+        pp_text = self.text_processor._preprocess_text(text, lang)
         text_chunks = self._chunk_text(pp_text, max_chunk_length)
         silence_samples = int(silence_duration * self.sample_rate)
 
@@ -337,7 +349,7 @@ class SupertonicModel(nn.Module):
 
         for text_chunk in text_chunks:
             # Tokenize each chunk (no further lang wrapping — already done)
-            text_ids_np, text_mask_np = text_processor([text_chunk], None)
+            text_ids_np, text_mask_np = self.text_processor([text_chunk], None)
 
             wav_t, dur_t = self.forward(
                 text_ids=torch.from_numpy(text_ids_np).to(device),
@@ -409,10 +421,9 @@ class SupertonicModel(nn.Module):
             max_chunk_length = 120 if lang == "ko" else 300
 
         device = next(self.parameters()).device
-        text_processor = UnicodeProcessor(str(self.unicode_indexer))
 
         # Preprocess once, then chunk (matches ONNX pipeline)
-        pp_text = text_processor._preprocess_text(text, lang)
+        pp_text = self.text_processor._preprocess_text(text, lang)
         text_chunks = self._chunk_text(pp_text, max_chunk_length)
 
         silence_wav = None
@@ -423,7 +434,7 @@ class SupertonicModel(nn.Module):
 
         for i, text_chunk in enumerate(text_chunks):
             # Tokenize each chunk (no further lang wrapping)
-            text_ids_np, text_mask_np = text_processor([text_chunk], None)
+            text_ids_np, text_mask_np = self.text_processor([text_chunk], None)
 
             wav_t, dur_t = self.forward(
                 text_ids=torch.from_numpy(text_ids_np).to(device),
