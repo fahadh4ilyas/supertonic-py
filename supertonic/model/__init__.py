@@ -100,8 +100,11 @@ class SupertonicModel(nn.Module):
         chunk_compress_factor: int = 6,
         unicode_indexer: str | Path | None = None,
         model_dir: str | Path | None = None,
+        device: str | torch.device | None = None,
     ):
         super().__init__()
+
+        self._device = torch.device(device) if device is not None else torch.device("cpu")
 
         self.unicode_indexer: Path | None = Path(unicode_indexer) if unicode_indexer is not None else None
         self.model_dir: Path | None = Path(model_dir) if model_dir is not None else None
@@ -130,6 +133,18 @@ class SupertonicModel(nn.Module):
         self.vocoder = Vocoder(config=ae.get("decoder"))
         self.audio_encoder = AudioEncoder(config=config)
 
+    @property
+    def device(self) -> torch.device:
+        return self._device
+
+    def to(self, *args, **kwargs):
+        ret = super().to(*args, **kwargs)
+        # Update _device when a device argument is provided (not dtype-only).
+        target = kwargs.get("device") or (args[0] if args else None)
+        if target is not None and not isinstance(target, torch.dtype):
+            ret._device = torch.device(target)
+        return ret
+
     def sample_noisy_latent(self, duration: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         bsz = duration.shape[0]
         wav_len_max = int(duration.max().item() * self.sample_rate)
@@ -137,12 +152,12 @@ class SupertonicModel(nn.Module):
         latent_len = int(math.ceil(wav_len_max / chunk_size))
         latent_dim = self.ldim * self.chunk_compress_factor
 
-        noisy_latent = torch.randn(bsz, latent_dim, latent_len, device=duration.device)
+        noisy_latent = torch.randn(bsz, latent_dim, latent_len, device=self.device)
 
         wav_lengths = (duration * self.sample_rate).long()
         latent_lengths = (wav_lengths + chunk_size - 1) // chunk_size
         max_len = latent_len
-        ids = torch.arange(max_len, device=duration.device).unsqueeze(0)
+        ids = torch.arange(max_len, device=self.device).unsqueeze(0)
         latent_mask = (ids < latent_lengths.unsqueeze(1)).float().unsqueeze(1)
         noisy_latent = noisy_latent * latent_mask
         return noisy_latent, latent_mask
@@ -174,8 +189,8 @@ class SupertonicModel(nn.Module):
         xt, latent_mask = self.sample_noisy_latent(dur_scaled)
 
         for step in range(total_steps):
-            cs = torch.full((text_ids.shape[0],), step, device=text_ids.device, dtype=torch.float32)
-            ts = torch.full((text_ids.shape[0],), total_steps, device=text_ids.device, dtype=torch.float32)
+            cs = torch.full((text_ids.shape[0],), step, device=self.device, dtype=torch.float32)
+            ts = torch.full((text_ids.shape[0],), total_steps, device=self.device, dtype=torch.float32)
             # VectorField output includes Euler step internally (matches ONNX)
             xt = self.vector_field(xt, text_emb, style_ttl, latent_mask, text_mask, cs, ts)
 
@@ -229,7 +244,7 @@ class SupertonicModel(nn.Module):
         """
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         state = checkpoint.get("encoder", checkpoint)
-        self.audio_encoder.load_state_dict(state)
+        self.audio_encoder.load_state_dict(state, strict=False)
         self.audio_encoder.eval()
 
     def has_encoder(self) -> bool:
@@ -255,8 +270,6 @@ class SupertonicModel(nn.Module):
                 "Train with scripts/train_encoder.py, then call load_encoder()."
             )
 
-        device = next(self.parameters()).device
-
         # Convert to waveform tensor (1, 1, T)
         if isinstance(voice_ref, (str, Path)):
             waveform, sr = torchaudio.load(str(voice_ref))
@@ -274,7 +287,7 @@ class SupertonicModel(nn.Module):
         else:
             raise TypeError(f"voice_ref must be str, Path, or np.ndarray, got {type(voice_ref)}")
 
-        waveform = waveform.to(device)
+        waveform = waveform.to(self.device)
 
         with torch.no_grad():
             style_ttl, style_dp = self.audio_encoder(waveform)
@@ -336,8 +349,6 @@ class SupertonicModel(nn.Module):
         if max_chunk_length is None:
             max_chunk_length = 120 if lang == "ko" else 300
 
-        device = next(self.parameters()).device
-
         # Preprocess once (unicode norm, language tokens, etc.) then chunk.
         # Matches ONNX pipeline: language tokens wrap the full text once.
         pp_text = self.text_processor._preprocess_text(text, lang)
@@ -352,10 +363,10 @@ class SupertonicModel(nn.Module):
             text_ids_np, text_mask_np = self.text_processor([text_chunk], None)
 
             wav_t, dur_t = self.forward(
-                text_ids=torch.from_numpy(text_ids_np).to(device),
-                style_ttl=torch.from_numpy(voice_style.ttl).to(device),
-                style_dp=torch.from_numpy(voice_style.dp).to(device),
-                text_mask=torch.from_numpy(text_mask_np).to(device),
+                text_ids=torch.from_numpy(text_ids_np).to(self.device),
+                style_ttl=torch.from_numpy(voice_style.ttl).to(self.device),
+                style_dp=torch.from_numpy(voice_style.dp).to(self.device),
+                text_mask=torch.from_numpy(text_mask_np).to(self.device),
                 total_steps=total_steps,
                 speed=speed,
             )
@@ -420,8 +431,6 @@ class SupertonicModel(nn.Module):
         if max_chunk_length is None:
             max_chunk_length = 120 if lang == "ko" else 300
 
-        device = next(self.parameters()).device
-
         # Preprocess once, then chunk (matches ONNX pipeline)
         pp_text = self.text_processor._preprocess_text(text, lang)
         text_chunks = self._chunk_text(pp_text, max_chunk_length)
@@ -437,10 +446,10 @@ class SupertonicModel(nn.Module):
             text_ids_np, text_mask_np = self.text_processor([text_chunk], None)
 
             wav_t, dur_t = self.forward(
-                text_ids=torch.from_numpy(text_ids_np).to(device),
-                style_ttl=torch.from_numpy(voice_style.ttl).to(device),
-                style_dp=torch.from_numpy(voice_style.dp).to(device),
-                text_mask=torch.from_numpy(text_mask_np).to(device),
+                text_ids=torch.from_numpy(text_ids_np).to(self.device),
+                style_ttl=torch.from_numpy(voice_style.ttl).to(self.device),
+                style_dp=torch.from_numpy(voice_style.dp).to(self.device),
+                text_mask=torch.from_numpy(text_mask_np).to(self.device),
                 total_steps=total_steps,
                 speed=speed,
             )
@@ -560,7 +569,7 @@ class SupertonicModel(nn.Module):
         indexer_path = model_dir / "unicode_indexer.json"
         unicode_indexer = indexer_path if indexer_path.exists() else None
 
-        model = cls(config=config, unicode_indexer=unicode_indexer, model_dir=model_dir)
+        model = cls(config=config, unicode_indexer=unicode_indexer, model_dir=model_dir, device=device)
 
         # Load weights
         state = safetensors.torch.load_file(str(model_dir / "model.safetensors"))

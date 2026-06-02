@@ -146,13 +146,19 @@ class RoPECrossAttention(nn.Module):
         self.W_value = nn.Linear(context_dim, attn_dim)
         self.out_fc = nn.Linear(attn_dim, query_dim)
 
-        theta = 10000.0 ** (-torch.arange(0, head_dim // 2).float() / (head_dim // 2))
+        theta = 10.0 * 10000.0 ** (-torch.arange(0, head_dim // 2).float() / (head_dim // 2))
         self.register_buffer("theta", theta)
         increments = torch.arange(max_seq_len).unsqueeze(0).unsqueeze(-1)
         self.register_buffer("increments", increments)
 
     def _apply_rope(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
         B, H, L, D = x.shape
+        # Grow increments buffer once if seq_len exceeds its capacity, so
+        # subsequent calls reuse the enlarged buffer instead of reallocating.
+        if seq_len > self.increments.shape[1]:
+            self.increments = torch.arange(seq_len, device=self.theta.device,
+                                           dtype=self.increments.dtype
+                                           ).unsqueeze(0).unsqueeze(-1)
         pos = self.increments[:, :seq_len, :].float() / seq_len
         angles = pos * self.theta
         x1, x2 = x[..., :D // 2], x[..., D // 2:]

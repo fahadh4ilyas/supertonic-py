@@ -49,12 +49,13 @@ class MelSpectrogram(nn.Module):
         self.register_buffer(
             "window",
             torch.hann_window(win_length),
+            persistent=False,
         )
 
         # Mel filter bank
         f_max = f_max or sample_rate / 2
         mel_fb = self._mel_filterbank(n_mels, n_fft, sample_rate, f_min, f_max)
-        self.register_buffer("mel_filterbank", mel_fb)
+        self.register_buffer("mel_filterbank", mel_fb, persistent=False)
 
     @staticmethod
     def _mel_filterbank(
@@ -228,6 +229,10 @@ class AudioEncoder(nn.Module):
             n_units=dp_st.get("n_units", 64),
         )
 
+    @property
+    def device(self) -> torch.device:
+        return next(self.parameters()).device
+
     def forward(
         self,
         waveform: torch.Tensor,
@@ -314,7 +319,6 @@ class AudioEncoder(nn.Module):
         if waveform.dim() == 2:
             waveform = waveform.unsqueeze(0)
 
-        device = next(self.parameters()).device
-        waveform = waveform.to(device)
+        waveform = waveform.to(self.device)
 
         return self.forward(waveform)
