@@ -558,8 +558,8 @@ def main():
                         help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-5,
                         help="Weight decay")
-    parser.add_argument("--total_steps", type=int, default=4,
-                        help="Diffusion steps for audio generation during training (fewer = faster)")
+    parser.add_argument("--total_steps", type=int, default=8,
+                        help="Diffusion steps for audio generation during training (default: 8)")
     parser.add_argument("--speed", type=float, default=1.0,
                         help="Speech speed for generated audio")
     parser.add_argument("--lambda_text", type=float, default=0.1,
@@ -581,16 +581,26 @@ def main():
                         default=_DEFAULT_VAL_STYLES,
                         help="Validation voice style names (default: F5 M5)")
     parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed")
+                        help="Random seed (used as fallback for train/val seeds)")
+    parser.add_argument("--train_seed", type=int, default=None,
+                        help="Seed for training randomness (dataset shuffle, style sampling). "
+                             "Falls back to --seed if not set.")
+    parser.add_argument("--val_seed", type=int, default=None,
+                        help="Seed for validation randomness (sample selection, style sampling). "
+                             "Falls back to --seed if not set.")
     parser.add_argument("--save_every", type=int, default=5,
                         help="Save checkpoint every N epochs")
     parser.add_argument("--val_every", type=int, default=5,
                         help="Run validation every N epochs")
+    parser.add_argument("--val_ratio", type=float, default=0.1,
+                        help="Fraction of dataset to use for validation (default: 0.1 = 10%%)")
     parser.add_argument("--log_every", type=int, default=10,
-                        help="Log metrics every N training steps")
-    parser.add_argument("--early_stopping_patience", type=int, default=None,
+                        help="Log detailed metrics every N epochs")
+    parser.add_argument("--bar_refresh_every", type=int, default=4,
+                        help="Update tqdm batch progress bar every N gradient steps (default: 4)")
+    parser.add_argument("--early_stopping_patience", type=int, default=10,
                         help="Stop after N validation checks without improvement. "
-                             "Requires --val_every > 0. Default: no early stopping.")
+                             "Set to 0 to disable. Default: 10")
     parser.add_argument("--early_stopping_metric", type=str, default="val_style",
                         choices=["val_style", "val_ttl", "val_dp"],
                         help="Which validation metric to monitor for early stopping.")
@@ -602,6 +612,11 @@ def main():
     args = parser.parse_args()
 
     # ── Setup ────────────────────────────────────────────────────────────────
+    train_seed = args.train_seed if args.train_seed is not None else args.seed
+    val_seed = args.val_seed if args.val_seed is not None else args.seed
+    train_rng = random.Random(train_seed)
+    val_rng = random.Random(val_seed)
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -704,7 +719,7 @@ def main():
 
         # Shuffle and create dataloader
         indices = list(range(len(dataset)))
-        random.shuffle(indices)
+        train_rng.shuffle(indices)
 
         if args.max_samples_per_style is not None:
             indices = indices[:args.max_samples_per_style]
@@ -776,7 +791,7 @@ def main():
                         step_style_names = train_style_names
                     else:
                         n = max(1, int(args.num_styles_per_train_step))
-                        step_style_names = random.sample(
+                        step_style_names = train_rng.sample(
                             train_style_names, min(n, len(train_style_names))
                         )
 
@@ -860,8 +875,8 @@ def main():
                 optimizer.zero_grad()
                 global_step += 1
 
-                # Update batch progress bar (throttled: every 4 gradient steps)
-                if global_step % 4 == 0:
+                # Update batch progress bar (throttled)
+                if global_step % args.bar_refresh_every == 0:
                     denom = max(epoch_steps, 1)
                     synth_denom = max(epoch_synth_steps, 1)
                     batch_pbar.set_postfix({
@@ -912,7 +927,7 @@ def main():
         if args.val_every > 0 and (epoch + 1) % args.val_every == 0 and val_styles:
             val_metrics = run_validation(
                 tts_model, encoder, val_styles, dataset,
-                text_processor, device, args,
+                text_processor, device, args, val_rng,
             )
             val_loss = val_metrics["val_style"]
             tqdm.write(
@@ -935,7 +950,7 @@ def main():
             else:
                 early_stop_counter += 1
 
-            if args.early_stopping_patience is not None and early_stop_counter >= args.early_stopping_patience:
+            if args.early_stopping_patience > 0 and early_stop_counter >= args.early_stopping_patience:
                 tqdm.write(
                     f"  Early stopping triggered after {early_stop_counter} "
                     f"checks without improvement in {args.early_stopping_metric}"
@@ -971,12 +986,11 @@ def run_validation(
     text_processor: UnicodeProcessor,
     device: torch.device,
     args: argparse.Namespace,
-    num_val_samples: int = 20,
+    val_rng: random.Random,
 ) -> dict[str, float]:
-    """Evaluate encoder on held-out styles (F5, M5).
+    """Evaluate encoder on held-out styles.
 
-    Evaluates ALL validation styles for each sample instead of picking one
-    randomly, giving a more thorough and stable validation signal.
+    Uses ``args.val_ratio`` to determine the number of validation samples.
 
     Returns dict with keys: val_style, val_ttl, val_dp.
     """
@@ -986,8 +1000,10 @@ def run_validation(
     total_dp = 0.0
     count = 0
 
+    num_val_samples = max(1, int(len(dataset) * args.val_ratio))
+
     val_style_names = sorted(val_styles.keys())
-    indices = random.sample(range(len(dataset)), min(num_val_samples, len(dataset)))
+    indices = val_rng.sample(range(len(dataset)), min(num_val_samples, len(dataset)))
 
     for idx in indices:
         sample = dataset[idx]
@@ -996,7 +1012,7 @@ def run_validation(
             step_style_names = val_style_names
         else:
             n = max(1, int(args.num_styles_per_val_step))
-            step_style_names = random.sample(
+            step_style_names = val_rng.sample(
                 val_style_names, min(n, len(val_style_names))
             )
 
