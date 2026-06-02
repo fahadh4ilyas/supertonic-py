@@ -56,8 +56,10 @@ from scripts.load_onnx_weights import (
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-TRAIN_STYLES = ["F1", "F2", "F3", "F4", "M1", "M2", "M3", "M4"]
-VAL_STYLES = ["F5", "M5"]
+# Style split is configurable via CLI args (--train_styles, --val_styles).
+# Defaults below are used when args are not provided.
+_DEFAULT_TRAIN_STYLES = ["F1", "F2", "F3", "F4", "M1", "M2", "M3", "M4"]
+_DEFAULT_VAL_STYLES = ["F5", "M5"]
 
 # From tts.json: typical speech rate ≈ 15 chars/sec at speed=1.0
 # 15-30s target ⇒ 225-450 chars at speed=1.0, scaled by speed
@@ -566,6 +568,18 @@ def main():
                         help="Weight for duration predictor consistency loss (0 = disabled)")
     parser.add_argument("--max_samples_per_style", type=int, default=None,
                         help="Max samples per style per epoch (limits dataset passes)")
+    parser.add_argument("--num_styles_per_train_step", type=str, default="1",
+                        help="Number of training styles per sample: int (e.g. '3') or 'all'. "
+                             "Default: 1 (random single style, original behavior)")
+    parser.add_argument("--num_styles_per_val_step", type=str, default="all",
+                        help="Number of validation styles per sample: int (e.g. '2') or 'all'. "
+                             "Default: all")
+    parser.add_argument("--train_styles", type=str, nargs="+",
+                        default=_DEFAULT_TRAIN_STYLES,
+                        help="Training voice style names (default: F1 F2 F3 F4 M1 M2 M3 M4)")
+    parser.add_argument("--val_styles", type=str, nargs="+",
+                        default=_DEFAULT_VAL_STYLES,
+                        help="Validation voice style names (default: F5 M5)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
     parser.add_argument("--save_every", type=int, default=5,
@@ -618,8 +632,8 @@ def main():
 
     # ── Load voice styles ────────────────────────────────────────────────────
     styles_dir = args.model_dir / "voice_styles"
-    train_styles = load_style_vectors(styles_dir, TRAIN_STYLES, device)
-    val_styles = load_style_vectors(styles_dir, VAL_STYLES, device)
+    train_styles = load_style_vectors(styles_dir, args.train_styles, device)
+    val_styles = load_style_vectors(styles_dir, args.val_styles, device)
 
     if not train_styles:
         raise RuntimeError(f"No training styles loaded from {styles_dir}")
@@ -708,10 +722,6 @@ def main():
                           leave=False, dynamic_ncols=True)
 
         for batch_idx, batch in enumerate(batch_pbar):
-            # Select a random training style for this batch
-            style_name = random.choice(train_style_names)
-            style_ttl_true, style_dp_true = train_styles[style_name]
-
             accumulated_loss = 0.0
 
             for i in range(len(batch["text_encoder"])):
@@ -724,74 +734,107 @@ def main():
 
                 # Step 1: Get reference audio
                 if voice_enc_path is not None:
-                    # Real audio: encoder input
+                    # Real audio: encoder input — process once (no style iteration)
                     audio = _load_real_audio(voice_enc_path, tts_model.sample_rate, device)
                     if audio is None:
                         epoch_samples_skipped += 1
                         continue
-                else:
-                    # Synthetic: generate from text + random style
-                    audio = generate_audio(
-                        tts_model, enc_ids, enc_mask,
-                        style_ttl_true, style_dp_true,
-                        total_steps=args.total_steps, speed=args.speed,
-                    )
-                if audio is None:
-                    epoch_samples_skipped += 1
-                    continue
-
-                audio_dur = audio.shape[-1] / tts_model.sample_rate
-                if audio_dur < 10:
-                    epoch_samples_skipped += 1
-                    continue
-
-                # Step 2: Encode audio → predicted style
-                with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                    style_ttl_pred, style_dp_pred = encoder(audio.unsqueeze(0))
-
-                # Step 3: Compute losses
-                if voice_enc_path is not None and voice_tts_path is not None:
-                    # Real audio: TTS-through reconstruction loss
-                    audio_tts = _load_real_audio(voice_tts_path, tts_model.sample_rate, device)
-                    if audio_tts is None:
+                    audio_dur = audio.shape[-1] / tts_model.sample_rate
+                    if audio_dur < 10:
                         epoch_samples_skipped += 1
                         continue
-                    loss_mel, loss_dur = tts_through_loss(
-                        tts_model, tts_ids, tts_mask,
-                        style_ttl_pred, style_dp_pred, audio_tts,
-                        total_steps=args.total_steps, speed=args.speed,
-                    )
-                    loss = loss_mel + loss_dur
-                    epoch_metrics["loss_style"] += loss.item()
-                    epoch_metrics["loss_style_ttl"] += loss_mel.item()
-                    epoch_metrics["loss_style_dp"] += loss_dur.item()
+
+                    # Step 2: Encode audio → predicted style
+                    with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                        style_ttl_pred, style_dp_pred = encoder(audio.unsqueeze(0))
+
+                    # Step 3: Compute losses
+                    if voice_tts_path is not None:
+                        # Real audio: TTS-through reconstruction loss
+                        audio_tts = _load_real_audio(voice_tts_path, tts_model.sample_rate, device)
+                        if audio_tts is None:
+                            epoch_samples_skipped += 1
+                            continue
+                        loss_mel, loss_dur = tts_through_loss(
+                            tts_model, tts_ids, tts_mask,
+                            style_ttl_pred, style_dp_pred, audio_tts,
+                            total_steps=args.total_steps, speed=args.speed,
+                        )
+                        loss = loss_mel + loss_dur
+                        epoch_metrics["loss_style"] += loss.item()
+                        epoch_metrics["loss_style_ttl"] += loss_mel.item()
+                        epoch_metrics["loss_style_dp"] += loss_dur.item()
+                    else:
+                        epoch_samples_skipped += 1
+                        continue
                 else:
-                    # Synthetic audio: MSE against known style vectors
-                    loss_ttl = F.mse_loss(style_ttl_pred, style_ttl_true)
-                    loss_dp = F.mse_loss(style_dp_pred, style_dp_true)
-                    loss = loss_ttl + loss_dp
-                    epoch_metrics["loss_style"] += loss.item()
-                    epoch_metrics["loss_style_ttl"] += loss_ttl.item()
-                    epoch_metrics["loss_style_dp"] += loss_dp.item()
+                    # Synthetic: iterate over training styles for this sample
+                    sample_total_loss = 0.0
+                    sample_num_styles = 0
+
+                    if args.num_styles_per_train_step == "all":
+                        step_style_names = train_style_names
+                    else:
+                        n = max(1, int(args.num_styles_per_train_step))
+                        step_style_names = random.sample(
+                            train_style_names, min(n, len(train_style_names))
+                        )
+
+                    for style_name in step_style_names:
+                        style_ttl_true, style_dp_true = train_styles[style_name]
+
+                        audio = generate_audio(
+                            tts_model, enc_ids, enc_mask,
+                            style_ttl_true, style_dp_true,
+                            total_steps=args.total_steps, speed=args.speed,
+                        )
+                        if audio is None:
+                            epoch_samples_skipped += 1
+                            continue
+
+                        audio_dur = audio.shape[-1] / tts_model.sample_rate
+                        if audio_dur < 10:
+                            epoch_samples_skipped += 1
+                            continue
+
+                        # Encode audio → predicted style
+                        with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                            style_ttl_pred, style_dp_pred = encoder(audio.unsqueeze(0))
+
+                        # MSE against known style vectors
+                        loss_ttl = F.mse_loss(style_ttl_pred, style_ttl_true)
+                        loss_dp = F.mse_loss(style_dp_pred, style_dp_true)
+                        loss_style = loss_ttl + loss_dp
+                        sample_total_loss = sample_total_loss + loss_style
+                        sample_num_styles += 1
+
+                        epoch_metrics["loss_style"] += loss_style.item()
+                        epoch_metrics["loss_style_ttl"] += loss_ttl.item()
+                        epoch_metrics["loss_style_dp"] += loss_dp.item()
+
+                        if args.lambda_text > 0:
+                            with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                                loss_text = text_encoder_loss(
+                                    tts_model, tts_ids, tts_mask,
+                                    style_ttl_pred, style_ttl_true,
+                                )
+                            sample_total_loss = sample_total_loss + args.lambda_text * loss_text
+                            epoch_metrics["loss_text"] += loss_text.item()
+
+                        if args.lambda_dur > 0:
+                            with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                                loss_dur_loss = duration_predictor_loss(
+                                    tts_model, tts_ids, tts_mask,
+                                    style_dp_pred, style_dp_true,
+                                )
+                            sample_total_loss = sample_total_loss + args.lambda_dur * loss_dur_loss
+                            epoch_metrics["loss_dur"] += loss_dur_loss.item()
+
+                    if sample_num_styles == 0:
+                        epoch_samples_skipped += 1
+                        continue
+                    loss = sample_total_loss / sample_num_styles
                     epoch_synth_steps += 1
-
-                if args.lambda_text > 0 and tts_ids is not None and voice_enc_path is None:
-                    with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                        loss_text = text_encoder_loss(
-                            tts_model, tts_ids, tts_mask,
-                            style_ttl_pred, style_ttl_true,
-                        )
-                    loss = loss + args.lambda_text * loss_text
-                    epoch_metrics["loss_text"] += loss_text.item()
-
-                if args.lambda_dur > 0 and tts_ids is not None and voice_enc_path is None:
-                    with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                        loss_dur = duration_predictor_loss(
-                            tts_model, tts_ids, tts_mask,
-                            style_dp_pred, style_dp_true,
-                        )
-                    loss = loss + args.lambda_dur * loss_dur
-                    epoch_metrics["loss_dur"] += loss_dur.item()
 
                 loss = loss / args.grad_accum_steps
 
@@ -932,6 +975,9 @@ def run_validation(
 ) -> dict[str, float]:
     """Evaluate encoder on held-out styles (F5, M5).
 
+    Evaluates ALL validation styles for each sample instead of picking one
+    randomly, giving a more thorough and stable validation signal.
+
     Returns dict with keys: val_style, val_ttl, val_dp.
     """
     encoder.eval()
@@ -945,29 +991,38 @@ def run_validation(
 
     for idx in indices:
         sample = dataset[idx]
-        style_name = random.choice(val_style_names)
-        style_ttl_true, style_dp_true = val_styles[style_name]
 
-        audio = generate_audio(
-            tts_model, sample["_enc_ids"], sample["_enc_mask"],
-            style_ttl_true, style_dp_true,
-            total_steps=args.total_steps, speed=args.speed,
-        )
-        if audio is None:
-            continue
+        if args.num_styles_per_val_step == "all":
+            step_style_names = val_style_names
+        else:
+            n = max(1, int(args.num_styles_per_val_step))
+            step_style_names = random.sample(
+                val_style_names, min(n, len(val_style_names))
+            )
 
-        audio_dur = audio.shape[-1] / tts_model.sample_rate
-        if audio_dur < 10:
-            continue
+        for style_name in step_style_names:
+            style_ttl_true, style_dp_true = val_styles[style_name]
 
-        style_ttl_pred, style_dp_pred = encoder(audio.unsqueeze(0).to(device))
+            audio = generate_audio(
+                tts_model, sample["_enc_ids"], sample["_enc_mask"],
+                style_ttl_true, style_dp_true,
+                total_steps=args.total_steps, speed=args.speed,
+            )
+            if audio is None:
+                continue
 
-        loss_style_ttl = F.mse_loss(style_ttl_pred, style_ttl_true)
-        loss_style_dp = F.mse_loss(style_dp_pred, style_dp_true)
-        total_ttl += loss_style_ttl.item()
-        total_dp += loss_style_dp.item()
-        total_style += (loss_style_ttl + loss_style_dp).item()
-        count += 1
+            audio_dur = audio.shape[-1] / tts_model.sample_rate
+            if audio_dur < 10:
+                continue
+
+            style_ttl_pred, style_dp_pred = encoder(audio.unsqueeze(0).to(device))
+
+            loss_style_ttl = F.mse_loss(style_ttl_pred, style_ttl_true)
+            loss_style_dp = F.mse_loss(style_dp_pred, style_dp_true)
+            total_ttl += loss_style_ttl.item()
+            total_dp += loss_style_dp.item()
+            total_style += (loss_style_ttl + loss_style_dp).item()
+            count += 1
 
     encoder.train()
     denom = max(count, 1)
