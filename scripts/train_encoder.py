@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import random
 import sys
 import time
@@ -226,11 +225,11 @@ class EncoderDataset(Dataset):
         print("Pre-tokenizing texts...", flush=True)
         for sample in tqdm(self.samples, desc="Tokenizing", unit="sample", dynamic_ncols=True):
             sample["_enc_ids"], sample["_enc_mask"] = text_processor(
-                [sample["text_encoder"]], sample.get("lang", "en")
+                [sample["text_encoder"]], sample.get("lang", "na")
             )
             sample["_tts_ids"], sample["_tts_mask"] = text_processor(
                 [sample["text_tts"] or sample["text_encoder"]],
-                sample.get("lang", "en"),
+                sample.get("lang", "na"),
             )
         print(f"Tokenization complete ({len(self.samples)} samples)")
 
@@ -270,7 +269,7 @@ class EncoderDataset(Dataset):
         if self.concat_short and short_texts:
             random.shuffle(short_texts)
             buffer_text = ""
-            buffer_lang = short_texts[0].get("lang", "en")
+            buffer_lang = short_texts[0].get("lang", "na")
             buffer_tts = short_texts[0].get("text_tts", "")
 
             for sample in short_texts:
@@ -315,9 +314,6 @@ class EncoderDataset(Dataset):
 def collate_fn(batch: list[dict]) -> dict:
     """Collate a batch — includes pre-tokenized arrays and voice_ref paths."""
     return {
-        "text_encoder": [s["text_encoder"] for s in batch],
-        "text_tts": [s["text_tts"] for s in batch],
-        "lang": [s.get("lang", "en") for s in batch],
         "_enc_ids": np.stack([s["_enc_ids"] for s in batch]),
         "_enc_mask": np.stack([s["_enc_mask"] for s in batch]),
         "_tts_ids": np.stack([s["_tts_ids"] for s in batch]),
@@ -566,8 +562,6 @@ def main():
                         help="Weight for text encoder output consistency loss (0 = disabled)")
     parser.add_argument("--lambda_dur", type=float, default=0.1,
                         help="Weight for duration predictor consistency loss (0 = disabled)")
-    parser.add_argument("--max_samples_per_style", type=int, default=None,
-                        help="Max samples per style per epoch (limits dataset passes)")
     parser.add_argument("--num_styles_per_train_step", type=str, default="1",
                         help="Number of training styles per sample: int (e.g. '3') or 'all'. "
                              "Default: 1 (random single style, original behavior)")
@@ -721,13 +715,10 @@ def main():
         indices = list(range(len(dataset)))
         train_rng.shuffle(indices)
 
-        if args.max_samples_per_style is not None:
-            indices = indices[:args.max_samples_per_style]
-
         dataloader = DataLoader(
             dataset,
             batch_size=args.batch_size,
-            sampler=torch.utils.data.SubsetRandomSampler(indices),
+            sampler=torch.utils.data.SequentialSampler(indices),
             collate_fn=collate_fn,
             drop_last=False,
         )
@@ -927,7 +918,7 @@ def main():
         if args.val_every > 0 and (epoch + 1) % args.val_every == 0 and val_styles:
             val_metrics = run_validation(
                 tts_model, encoder, val_styles, dataset,
-                text_processor, device, args, val_rng,
+                device, args, val_rng,
             )
             val_loss = val_metrics["val_style"]
             tqdm.write(
@@ -983,7 +974,6 @@ def run_validation(
     encoder: AudioEncoder,
     val_styles: dict[str, tuple[torch.Tensor, torch.Tensor]],
     dataset: EncoderDataset,
-    text_processor: UnicodeProcessor,
     device: torch.device,
     args: argparse.Namespace,
     val_rng: random.Random,
