@@ -558,6 +558,8 @@ def main():
                         help="Diffusion steps for audio generation during training (default: 8)")
     parser.add_argument("--speed", type=float, default=1.0,
                         help="Speech speed for generated audio")
+    parser.add_argument("--use_tts_encoder", action="store_true",
+                        help="Train the encoder inside the loaded TTS model instead of a fresh one")
     parser.add_argument("--lambda_text", type=float, default=0.1,
                         help="Weight for text encoder output consistency loss (0 = disabled)")
     parser.add_argument("--lambda_dur", type=float, default=0.1,
@@ -649,12 +651,17 @@ def main():
     print(f"Training styles: {list(train_styles.keys())}")
     print(f"Validation styles: {list(val_styles.keys())}")
 
-    # ── Create encoder model ─────────────────────────────────────────────────
-    with open(args.model_dir / "tts.json") as f:
-        tts_config = json.load(f)
-
-    encoder = AudioEncoder(config=tts_config)
-    encoder = encoder.to(device)
+    # ── Create / select encoder model ────────────────────────────────────────
+    if args.use_tts_encoder:
+        encoder = tts_model.audio_encoder
+        for param in encoder.parameters():
+            param.requires_grad = True
+        print("Using encoder from loaded TTS model")
+    else:
+        with open(args.model_dir / "tts.json") as f:
+            tts_config = json.load(f)
+        encoder = AudioEncoder(config=tts_config)
+        encoder = encoder.to(device)
     encoder.train()
 
     total_params = sum(p.numel() for p in encoder.parameters())
