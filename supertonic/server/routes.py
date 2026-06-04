@@ -706,13 +706,6 @@ def include_voice_routes(app: FastAPI) -> None:
         if state.tts is None:
             return JSONResponse(status_code=503, content={"error": "server not ready"})
 
-        if not getattr(state.tts, "has_encoder", lambda: False)():
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Voice upload requires PyTorch backend with a trained AudioEncoder. "
-                                  "Start with --no-use-onnx and call model.load_encoder()."},
-            )
-
         audio_bytes = await audio_sample.read()
         file_size = len(audio_bytes)
 

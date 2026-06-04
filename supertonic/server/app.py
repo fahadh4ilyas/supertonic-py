@@ -200,6 +200,14 @@ def create_app(
                 state.tts = SupertonicModel.from_pretrained(
                     str(model_dir), device=state.device,
                 )
+                if state.tts.has_encoder():
+                    include_voice_routes(app)
+                else:
+                    logger.warning(
+                        "AudioEncoder is not trained — voice upload (POST /v1/audio/voices) "
+                        "is disabled. Train with scripts/train_encoder.py and call "
+                        "model.load_encoder()."
+                    )
         state.custom_styles = styles_store.scan(state.custom_styles_dir)
         state.is_ready = True
         logger.info(
@@ -243,11 +251,5 @@ def create_app(
     app.add_middleware(StyleImportSizeLimit, max_bytes=MAX_STYLE_IMPORT_BYTES)
 
     register_routes(app)
-
-    # Voice management — upload requires PyTorch backend with AudioEncoder,
-    # so only register when not using ONNX. Delete is registered in
-    # register_routes for both backends.
-    if not use_onnx:
-        include_voice_routes(app)
 
     return app
