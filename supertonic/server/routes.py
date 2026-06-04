@@ -96,14 +96,14 @@ def _resolve_voice(state: "ServerState", voice_name: str):
         raise RuntimeError("server not ready")
     if voice_name in tts.voice_style_names:
         return tts.get_voice_style(voice_name)
-    # Check uploaded voices (encoder-extracted styles)
-    if hasattr(tts, "has_encoder") and tts.has_encoder():
-        voices_dir = get_custom_voices_dir()
-        result = voice_manager.load_voice(voices_dir, voice_name)
-        if result is not None:
-            style_ttl_np = result[0].cpu().numpy()
-            style_dp_np = result[1].cpu().numpy()
-            return Style(style_ttl_onnx=style_ttl_np, style_dp_onnx=style_dp_np)
+    # Check uploaded voices (safetensors stored on disk). Works for both
+    # backends — ONNX just loads pre-extracted vectors without an encoder.
+    voices_dir = get_custom_voices_dir()
+    result = voice_manager.load_voice(voices_dir, voice_name)
+    if result is not None:
+        style_ttl_np = result[0].cpu().numpy()
+        style_dp_np = result[1].cpu().numpy()
+        return Style(style_ttl_onnx=style_ttl_np, style_dp_onnx=style_dp_np)
     custom_path = state.custom_styles.get(voice_name)
     if custom_path is not None:
         return tts.get_voice_style_from_path(custom_path)
@@ -665,12 +665,28 @@ def register_routes(app: FastAPI) -> None:
         finally:
             # Clean up: If the client disconnects or an error occurs, kill the TTS worker
             worker_task.cancel()
+    
+    @router.delete("/v1/audio/voices/{name}")
+    async def delete_voice(name: str, request: Request):
+        """Delete an uploaded voice."""
+        state = _state(request)
+        if state.tts is None:
+            return JSONResponse(status_code=503, content={"error": "server not ready"})
+
+        voices_dir = get_custom_voices_dir()
+        deleted = voice_manager.delete_voice(voices_dir, name)
+        if not deleted:
+            return JSONResponse(
+                status_code=404,
+                content={"success": False, "error": f"Voice '{name}' not found"},
+            )
+        return {"success": True, "message": f"Voice '{name}' deleted successfully"}
 
     app.include_router(router)
 
 
 def include_voice_routes(app: FastAPI) -> None:
-    """Conditionally include voice management routes (PyTorch backend only)."""
+    """Include voice management routes (upload requires PyTorch+encoder; delete works for both)."""
     voice_router = APIRouter()
 
     @voice_router.post("/v1/audio/voices")
@@ -690,7 +706,7 @@ def include_voice_routes(app: FastAPI) -> None:
         if state.tts is None:
             return JSONResponse(status_code=503, content={"error": "server not ready"})
 
-        if state.use_onnx or not getattr(state.tts, "has_encoder", lambda: False)():
+        if not getattr(state.tts, "has_encoder", lambda: False)():
             return JSONResponse(
                 status_code=400,
                 content={"error": "Voice upload requires PyTorch backend with a trained AudioEncoder. "
@@ -732,21 +748,5 @@ def include_voice_routes(app: FastAPI) -> None:
         )
 
         return {"success": True, "voice": meta}
-
-    @voice_router.delete("/v1/audio/voices/{name}")
-    async def delete_voice(name: str, request: Request):
-        """Delete an uploaded voice."""
-        state = _state(request)
-        if state.tts is None:
-            return JSONResponse(status_code=503, content={"error": "server not ready"})
-
-        voices_dir = get_custom_voices_dir()
-        deleted = voice_manager.delete_voice(voices_dir, name)
-        if not deleted:
-            return JSONResponse(
-                status_code=404,
-                content={"success": False, "error": f"Voice '{name}' not found"},
-            )
-        return {"success": True, "message": f"Voice '{name}' deleted successfully"}
 
     app.include_router(voice_router)

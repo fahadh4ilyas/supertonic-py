@@ -588,6 +588,7 @@ class SupertonicModel(nn.Module):
         if device is not None:
             model = model.to(device)
 
+        model.eval()
         return model
 
 
