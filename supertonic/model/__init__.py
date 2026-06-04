@@ -349,9 +349,10 @@ class SupertonicModel(nn.Module):
         if max_chunk_length is None:
             max_chunk_length = 120 if lang == "ko" else 300
 
-        # Preprocess once (unicode norm, language tokens, etc.) then chunk.
-        # Matches ONNX pipeline: language tokens wrap the full text once.
-        pp_text = self.text_processor._preprocess_text(text, lang)
+        # Preprocess text (unicode norm, cleaning) but defer language token
+        # wrapping to per-chunk tokenization — matches ONNX pipeline behavior
+        # where language tags are applied per chunk, not on the full text.
+        pp_text = self.text_processor._preprocess_text(text, None)
         text_chunks = self._chunk_text(pp_text, max_chunk_length)
         silence_samples = int(silence_duration * self.sample_rate)
 
@@ -359,8 +360,8 @@ class SupertonicModel(nn.Module):
         dur_list = []
 
         for text_chunk in text_chunks:
-            # Tokenize each chunk (no further lang wrapping — already done)
-            text_ids_np, text_mask_np = self.text_processor([text_chunk], None)
+            # Tokenize each chunk with per-chunk language wrapping
+            text_ids_np, text_mask_np = self.text_processor([text_chunk], lang)
 
             wav_t, dur_t = self.forward(
                 text_ids=torch.from_numpy(text_ids_np).to(self.device),
@@ -431,8 +432,9 @@ class SupertonicModel(nn.Module):
         if max_chunk_length is None:
             max_chunk_length = 120 if lang == "ko" else 300
 
-        # Preprocess once, then chunk (matches ONNX pipeline)
-        pp_text = self.text_processor._preprocess_text(text, lang)
+        # Preprocess text (unicode norm, cleaning) but defer language token
+        # wrapping to per-chunk tokenization — matches ONNX pipeline behavior.
+        pp_text = self.text_processor._preprocess_text(text, None)
         text_chunks = self._chunk_text(pp_text, max_chunk_length)
 
         silence_wav = None
@@ -442,8 +444,8 @@ class SupertonicModel(nn.Module):
             silence_wav_half = np.zeros((1, int(silence_duration * self.sample_rate / 2.0)), dtype=np.float32)
 
         for i, text_chunk in enumerate(text_chunks):
-            # Tokenize each chunk (no further lang wrapping)
-            text_ids_np, text_mask_np = self.text_processor([text_chunk], None)
+            # Tokenize each chunk with per-chunk language wrapping
+            text_ids_np, text_mask_np = self.text_processor([text_chunk], lang)
 
             wav_t, dur_t = self.forward(
                 text_ids=torch.from_numpy(text_ids_np).to(self.device),
