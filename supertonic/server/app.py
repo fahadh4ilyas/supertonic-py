@@ -244,7 +244,9 @@ def create_app(
 
     register_routes(app)
 
-    # Voice management (POST/DELETE /v1/audio/voices) — PyTorch backend only
+    # Voice management — upload requires PyTorch backend with AudioEncoder,
+    # so only register when not using ONNX. Delete is registered in
+    # register_routes for both backends.
     if not use_onnx:
         include_voice_routes(app)
 
