@@ -737,7 +737,7 @@ def main():
         for batch_idx, batch in enumerate(batch_pbar):
             accumulated_loss = 0.0
 
-            for i in range(len(batch["text_encoder"])):
+            for i in range(len(batch["_enc_ids"])):
                 enc_ids = batch["_enc_ids"][i]
                 enc_mask = batch["_enc_mask"][i]
                 tts_ids = batch["_tts_ids"][i]
