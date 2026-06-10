@@ -1,0 +1,57 @@
+version: "3.8"
+
+services:
+  supertonic:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        # ── Switch to GPU base image ──
+        # BASE_IMAGE: nvidia/cuda:12.1-runtime-ubuntu22.04
+        BASE_IMAGE: python:3.11-slim
+    image: supertonic:latest
+    container_name: supertonic
+    ports:
+      - "${SUPERTONIC_SERVE_PORT:-7788}:7788"
+    environment:
+      # ── Serve configuration ──
+      - SUPERTONIC_SERVE_MODEL=${SUPERTONIC_SERVE_MODEL:-supertonic-3}
+      - SUPERTONIC_SERVE_USE_ONNX=${SUPERTONIC_SERVE_USE_ONNX:-1}
+      - SUPERTONIC_SERVE_HOST=0.0.0.0
+      - SUPERTONIC_SERVE_PORT=7788
+      - SUPERTONIC_SERVE_WORKERS=${SUPERTONIC_SERVE_WORKERS:-1}
+      - SUPERTONIC_SERVE_DEVICE=${SUPERTONIC_SERVE_DEVICE:-}
+      - SUPERTONIC_SERVE_CORS=${SUPERTONIC_SERVE_CORS:-}
+      - SUPERTONIC_SERVE_CUSTOM_STYLES_DIR=${SUPERTONIC_SERVE_CUSTOM_STYLES_DIR:-}
+      - SUPERTONIC_SERVE_RELOAD=${SUPERTONIC_SERVE_RELOAD:-0}
+      - SUPERTONIC_SERVE_LOG_LEVEL=${SUPERTONIC_LOG_LEVEL:-info}
+      # ── Supertonic runtime ──
+      - SUPERTONIC_CACHE_DIR=/cache/supertonic
+      - SUPERTONIC_LOG_LEVEL=${SUPERTONIC_LOG_LEVEL:-INFO}
+      - SUPERTONIC_INTRA_OP_THREADS=${SUPERTONIC_INTRA_OP_THREADS:-}
+      - SUPERTONIC_INTER_OP_THREADS=${SUPERTONIC_INTER_OP_THREADS:-}
+      - SUPERTONIC_MODEL_REVISION=${SUPERTONIC_MODEL_REVISION:-}
+      - SUPERTONIC_CUSTOM_VOICES_DIR=/cache/supertonic/speakers
+    volumes:
+      # ── Model cache (persisted across container restarts) ──
+      - supertonic_cache:/cache/supertonic
+      # ── Host cache read-only fallback ──
+      - ${HOME:-~}/.cache/supertonic:/host_cache/supertonic:ro
+      - ${HOME:-~}/.cache/supertonic2:/host_cache/supertonic2:ro
+      - ${HOME:-~}/.cache/supertonic3:/host_cache/supertonic3:ro
+      # ── Custom voices directory ──
+      - ${SUPERTONIC_CUSTOM_VOICES_DIR:-~/.cache/supertonic/speakers}:/cache/supertonic/speakers
+    restart: unless-stopped
+
+    # ── GPU support — uncomment for NVIDIA GPUs ──
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+volumes:
+  supertonic_cache:
+    name: supertonic_cache
