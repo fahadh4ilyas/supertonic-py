@@ -2,8 +2,11 @@
 # CPU (default):
 #   docker build -t supertonic .
 # GPU (CUDA 12):
-#   docker build --build-arg BASE_IMAGE=nvidia/cuda:12.1-runtime-ubuntu22.04 -t supertonic:gpu .
+#   docker build --build-arg BASE_IMAGE=nvidia/cuda:12.1-runtime-ubuntu22.04 \
+#                --build-arg PYTORCH_INDEX=https://download.pytorch.org/whl/cu121 \
+#                -t supertonic:gpu .
 ARG BASE_IMAGE=python:3.11-slim
+ARG PYTORCH_INDEX=https://download.pytorch.org/whl/cpu
 FROM ${BASE_IMAGE}
 
 # ── System dependencies ──
@@ -14,9 +17,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ── Python setup ──
 WORKDIR /app
 
-# Install Python deps first (layer caching)
+# Install torch with the correct index (CPU or CUDA).
+# --no-deps avoids pulling numpy from the PyTorch index.
+ARG PYTORCH_INDEX
+RUN pip install --no-cache-dir --no-deps \
+    --index-url ${PYTORCH_INDEX} \
+    torch torchaudio
+
+# Install remaining Python deps (skip torch/torchaudio — already installed above)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
+RUN grep -v '^torch' requirements.txt > requirements-no-torch.txt \
+    && pip install --no-cache-dir -r requirements-no-torch.txt \
     && pip install --no-cache-dir fastapi uvicorn[standard] pydantic python-multipart
 
 # Copy package source
