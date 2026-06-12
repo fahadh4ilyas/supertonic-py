@@ -444,6 +444,58 @@ wav, _ = tts.synthesize("Some uncommon text.", voice_style=style, lang="na")
 
 
 
+## Docker
+
+Pre-built `Dockerfile` and `docker-compose.yaml` for running `supertonic serve`
+in a container with persistent model caching.
+
+### Quick start
+
+```bash
+cd docker
+docker compose up -d
+```
+
+The server listens on `http://localhost:7788`. Model cache is stored in a
+named volume (`supertonic_cache`) so it survives container rebuilds.
+
+### CPU vs GPU
+
+The base image is controlled by a build arg — swap it for GPU support:
+
+```bash
+# CPU (default)
+docker compose up -d
+
+# GPU — uncomment BASE_IMAGE and deploy section in docker-compose.yaml, then:
+docker compose build --build-arg BASE_IMAGE=nvidia/cuda:12.1-runtime-ubuntu22.04
+docker compose up -d
+```
+
+### Environment variables
+
+All `SUPERTONIC_*` variables are passed through from the host or a `.env` file:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SUPERTONIC_SERVE_MODEL` | `supertonic-3` | Model to load |
+| `SUPERTONIC_SERVE_USE_ONNX` | `1` | `1` = ONNX, `0` = PyTorch |
+| `SUPERTONIC_SERVE_WORKERS` | `1` | Number of uvicorn workers |
+| `SUPERTONIC_SERVE_DEVICE` | (empty) | Torch device for PyTorch (`cuda`, `cpu`) |
+| `SUPERTONIC_SERVE_CORS` | (empty) | Comma-separated CORS origins |
+| `SUPERTONIC_LOG_LEVEL` | `INFO` | Logging level |
+| `SUPERTONIC_INTRA_OP_THREADS` | (empty) | ONNX intra-op threads |
+| `SUPERTONIC_INTER_OP_THREADS` | (empty) | ONNX inter-op threads |
+
+### Volumes
+
+| Mount | Purpose |
+|-------|---------|
+| `supertonic_cache:/cache/supertonic` | Model cache (persistent named volume) |
+| `~/.cache/supertonic:/host_cache/supertonic:ro` | Host cache read-only fallback |
+| `~/.cache/supertonic/speakers:/cache/supertonic/speakers` | Uploaded custom voices |
+
+
 ## Performance
 
 We evaluated Supertonic's performance (with 2 inference steps) using two key metrics across input texts of varying lengths: Short (59 chars), Mid (152 chars), and Long (266 chars).
