@@ -7,7 +7,8 @@ services:
         # ── Switch to GPU base image ──
         # BASE_IMAGE: nvidia/cuda:12.1-runtime-ubuntu22.04
         BASE_IMAGE: python:3.11-slim
-    container_name: supertonic
+    image: supertonic:latest
+    container_name: supertonic-api
     ports:
       - "${SUPERTONIC_SERVE_PORT:-7788}:7788"
     environment:

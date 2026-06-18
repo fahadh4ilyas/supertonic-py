@@ -705,6 +705,14 @@ def main():
     # ── Dataset (moved after text_processor init for pre-tokenization) ──────
     dataset = EncoderDataset(args.dataset, text_processor=text_processor)
 
+    # Validation uses only text-only samples (real-audio samples have no
+    # ground-truth style vectors to compare against).
+    val_dataset = [s for s in dataset.samples if s.get("_voice_enc_path") is None]
+    if val_dataset:
+        print(f"Validation text-only samples: {len(val_dataset)}")
+    else:
+        print("WARNING: no text-only samples available for validation")
+
     # ── Training loop ────────────────────────────────────────────────────────
     train_style_names = sorted(train_styles.keys())
 
@@ -922,9 +930,9 @@ def main():
         scheduler.step()
 
         # ── Validation ───────────────────────────────────────────────────────
-        if args.val_every > 0 and (epoch + 1) % args.val_every == 0 and val_styles:
+        if args.val_every > 0 and (epoch + 1) % args.val_every == 0 and val_styles and val_dataset:
             val_metrics = run_validation(
-                tts_model, encoder, val_styles, dataset,
+                tts_model, encoder, val_styles, val_dataset,
                 device, args, val_rng,
             )
             val_loss = val_metrics["val_style"]
@@ -980,14 +988,14 @@ def run_validation(
     tts_model: SupertonicModel,
     encoder: AudioEncoder,
     val_styles: dict[str, tuple[torch.Tensor, torch.Tensor]],
-    dataset: EncoderDataset,
+    val_samples: list[dict],
     device: torch.device,
     args: argparse.Namespace,
     val_rng: random.Random,
 ) -> dict[str, float]:
-    """Evaluate encoder on held-out styles.
+    """Evaluate encoder on held-out styles using text-only samples.
 
-    Uses ``args.val_ratio`` to determine the number of validation samples.
+    *val_samples* must be pre-filtered to text-only entries (no voice_encoder).
 
     Returns dict with keys: val_style, val_ttl, val_dp.
     """
@@ -997,13 +1005,13 @@ def run_validation(
     total_dp = 0.0
     count = 0
 
-    num_val_samples = max(1, int(len(dataset) * args.val_ratio))
+    num_val_samples = max(1, int(len(val_samples) * args.val_ratio))
 
     val_style_names = sorted(val_styles.keys())
-    indices = val_rng.sample(range(len(dataset)), min(num_val_samples, len(dataset)))
+    indices = val_rng.sample(range(len(val_samples)), min(num_val_samples, len(val_samples)))
 
     for idx in indices:
-        sample = dataset[idx]
+        sample = val_samples[idx]
 
         if args.num_styles_per_val_step == "all":
             step_style_names = val_style_names

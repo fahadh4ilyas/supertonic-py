@@ -453,7 +453,7 @@ in a container with persistent model caching.
 
 ```bash
 cd docker
-docker compose up -d
+docker compose up -d --build
 ```
 
 The server listens on `http://localhost:7788`. Model cache is stored in a
@@ -465,7 +465,7 @@ The base image is controlled by a build arg — swap it for GPU support:
 
 ```bash
 # CPU (default)
-docker compose up -d
+docker compose up -d --build
 
 # GPU — uncomment BASE_IMAGE and deploy section in docker-compose.yaml, then:
 docker compose build --build-arg BASE_IMAGE=nvidia/cuda:12.1-runtime-ubuntu22.04
