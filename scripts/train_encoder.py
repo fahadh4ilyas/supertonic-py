@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 """Train the AudioEncoder to extract voice style vectors from reference audio.
 
-Training approach:
-    For each text pair (text_encoder, text_tts) and a randomly selected
-    training voice style, audio is generated via the frozen TTS model and
-    fed into the AudioEncoder. The encoder is trained to recover the
-    original style vectors, optionally with an auxiliary loss that ensures
-    the predicted styles produce the same TextEncoder conditioning.
+Two training modes, driven by the dataset:
+
+    Text-only (synthetic):  text → frozen TTS (with known style) → audio
+                            → encoder → predicted style → MSE vs true style
+                            + optional TextEncoder/DurationPredictor aux losses
+
+    Real-audio (cloned):    voice_encoder audio → encoder → predicted style
+                            → frozen TTS → synthesized audio
+                            → Mel loss vs voice_tts target audio
 
 Usage:
     python scripts/train_encoder.py --dataset data.jsonl --output_dir ./checkpoints
 
 Dataset format (JSONL):
-    {"text_encoder": "Long text for encoder input...", "text_tts": "Shorter text for TTS-through loss", "lang": "en"}
+    {"text_encoder": "Long text for encoder input...",
+     "text_tts": "Shorter text for TTS-through loss",
+     "lang": "en",
+     "voice_encoder": "path/to/ref_audio.wav",   # optional: real audio mode
+     "voice_tts": "path/to/target_audio.wav"}     # optional: Mel reconstruction target
 """
 
 from __future__ import annotations
@@ -24,12 +31,11 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+import torchaudio
 from torch.utils.data import DataLoader, Dataset
 from torch.amp import GradScaler, autocast
 from tqdm import tqdm
@@ -279,6 +285,8 @@ class EncoderDataset(Dataset):
                         "text_encoder": candidate[:self.max_chars],
                         "text_tts": buffer_tts or sample.get("text_tts", ""),
                         "lang": buffer_lang,
+                        "_voice_enc_path": None,
+                        "_voice_tts_path": None,
                     })
                     buffer_text = ""
                 else:
@@ -293,8 +301,10 @@ class EncoderDataset(Dataset):
                     buffer_text = f"{buffer_text}. {buffer_text}"
                 prepared.append({
                     "text_encoder": buffer_text[:self.max_chars],
-                    "text_tts": buffer_tts,
+                    "text_tts": buffer_tts or "",
                     "lang": buffer_lang,
+                    "_voice_enc_path": None,
+                    "_voice_tts_path": None,
                 })
 
         self.samples = prepared
@@ -400,20 +410,9 @@ def generate_audio(
 def _load_real_audio(path: str, target_sr: int, device: torch.device) -> torch.Tensor | None:
     """Load a real audio file, resample if needed, return as (1, T) tensor on device."""
     try:
-        import torchaudio
         waveform, sr = torchaudio.load(path)
         if sr != target_sr:
             waveform = torchaudio.transforms.Resample(sr, target_sr)(waveform)
-    except ImportError:
-        import soundfile as sf
-        import scipy.signal
-        wav_np, sr = sf.read(path)
-        if wav_np.ndim > 1:
-            wav_np = wav_np.mean(axis=1)
-        if sr != target_sr:
-            num_samples = int(len(wav_np) * target_sr / sr)
-            wav_np = scipy.signal.resample(wav_np, num_samples)
-        waveform = torch.from_numpy(wav_np.astype(np.float32)).unsqueeze(0)
     except Exception:
         return None
     if waveform.shape[0] > 1:
@@ -461,19 +460,20 @@ def tts_through_loss(
     """TTS-through reconstruction loss: generate audio from predicted style,
     compare mel-spectrograms with the target audio."""
     device = style_ttl_pred.device
-    text_ids = torch.from_numpy(text_ids_np).to(device)
-    text_mask = torch.from_numpy(text_mask_np).to(device)
+    text_ids = np.expand_dims(text_ids_np, axis=0) if text_ids_np.ndim == 1 else text_ids_np
+    text_mask = np.expand_dims(text_mask_np, axis=0) if text_mask_np.ndim == 2 else text_mask_np
+    text_ids_t = torch.from_numpy(text_ids).to(device)
+    text_mask_t = torch.from_numpy(text_mask).to(device)
 
-    dur_pred = tts_model.duration_predictor(text_ids, style_dp_pred, text_mask)
+    dur_pred = tts_model.duration_predictor(text_ids_t, style_dp_pred, text_mask_t)
     dur_actual = target_wav.shape[-1] / tts_model.sample_rate
     dur_loss = F.smooth_l1_loss(
-        torch.log(dur_pred.clamp(min=1e-6)),
-        torch.log(torch.tensor(dur_actual, device=device).clamp(min=1e-6)),
+        dur_pred, torch.tensor([dur_actual], device=device),
     )
 
     wav_pred, _ = tts_model.forward(
-        text_ids=text_ids, style_ttl=style_ttl_pred, style_dp=style_dp_pred,
-        text_mask=text_mask, total_steps=total_steps, speed=speed,
+        text_ids=text_ids_t, style_ttl=style_ttl_pred, style_dp=style_dp_pred,
+        text_mask=text_mask_t, total_steps=total_steps, speed=speed,
     )
 
     mel = _get_mel(tts_model, device)
@@ -493,14 +493,21 @@ def text_encoder_loss(
     style_ttl_true: torch.Tensor,
 ) -> torch.Tensor:
     """Compute MSE between TextEncoder outputs for predicted vs true styles."""
-    with torch.no_grad():
-        text_ids = torch.from_numpy(text_ids_np).to(style_ttl_pred.device)
-        text_mask = torch.from_numpy(text_mask_np).to(style_ttl_pred.device)
-        enc_true = tts_model.text_encoder(text_ids, style_ttl_true, text_mask)
+    text_ids = np.expand_dims(text_ids_np, axis=0) if text_ids_np.ndim == 1 else text_ids_np
+    text_mask = np.expand_dims(text_mask_np, axis=0) if text_mask_np.ndim == 2 else text_mask_np
 
-    text_ids = torch.from_numpy(text_ids_np).to(style_ttl_pred.device)
-    text_mask = torch.from_numpy(text_mask_np).to(style_ttl_pred.device)
-    enc_pred = tts_model.text_encoder(text_ids, style_ttl_pred, text_mask)
+    with torch.no_grad():
+        enc_true = tts_model.text_encoder(
+            torch.from_numpy(text_ids).to(style_ttl_pred.device),
+            style_ttl_true,
+            torch.from_numpy(text_mask).to(style_ttl_pred.device),
+        )
+
+    enc_pred = tts_model.text_encoder(
+        torch.from_numpy(text_ids).to(style_ttl_pred.device),
+        style_ttl_pred,
+        torch.from_numpy(text_mask).to(style_ttl_pred.device),
+    )
 
     return F.mse_loss(enc_pred, enc_true)
 
@@ -513,14 +520,21 @@ def duration_predictor_loss(
     style_dp_true: torch.Tensor,
 ) -> torch.Tensor:
     """Compute log-space Huber loss between DurationPredictor outputs."""
-    with torch.no_grad():
-        text_ids = torch.from_numpy(text_ids_np).to(style_dp_pred.device)
-        text_mask = torch.from_numpy(text_mask_np).to(style_dp_pred.device)
-        dur_true = tts_model.duration_predictor(text_ids, style_dp_true, text_mask)
+    text_ids = np.expand_dims(text_ids_np, axis=0) if text_ids_np.ndim == 1 else text_ids_np
+    text_mask = np.expand_dims(text_mask_np, axis=0) if text_mask_np.ndim == 2 else text_mask_np
 
-    text_ids = torch.from_numpy(text_ids_np).to(style_dp_pred.device)
-    text_mask = torch.from_numpy(text_mask_np).to(style_dp_pred.device)
-    dur_pred = tts_model.duration_predictor(text_ids, style_dp_pred, text_mask)
+    with torch.no_grad():
+        dur_true = tts_model.duration_predictor(
+            torch.from_numpy(text_ids).to(style_dp_pred.device),
+            style_dp_true,
+            torch.from_numpy(text_mask).to(style_dp_pred.device),
+        )
+
+    dur_pred = tts_model.duration_predictor(
+        torch.from_numpy(text_ids).to(style_dp_pred.device),
+        style_dp_pred,
+        torch.from_numpy(text_mask).to(style_dp_pred.device),
+    )
 
     return F.smooth_l1_loss(torch.log(dur_pred.clamp(min=1e-6)), torch.log(dur_true.clamp(min=1e-6)))
 
@@ -564,6 +578,10 @@ def main():
                         help="Weight for text encoder output consistency loss (0 = disabled)")
     parser.add_argument("--lambda_dur", type=float, default=0.1,
                         help="Weight for duration predictor consistency loss (0 = disabled)")
+    parser.add_argument("--lambda_style_ttl", type=float, default=1.0,
+                        help="Weight for style_ttl MSE loss (voice character)")
+    parser.add_argument("--lambda_style_dp", type=float, default=1.0,
+                        help="Weight for style_dp MSE loss (speaking rate)")
     parser.add_argument("--num_styles_per_train_step", type=str, default="1",
                         help="Number of training styles per sample: int (e.g. '3') or 'all'. "
                              "Default: 1 (random single style, original behavior)")
@@ -623,6 +641,13 @@ def main():
     print(f"Using device: {device}")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save training config for reproducibility
+    config_path = args.output_dir / "train_config.json"
+    config_dict = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+    with open(config_path, "w") as f:
+        json.dump(config_dict, f, indent=2)
+    print(f"Training config saved to {config_path}")
 
     # ── Ensure model exists (download + convert ONNX→PyTorch if needed) ──────
     args.model_dir = ensure_model_ready(args.model_dir)
@@ -743,8 +768,6 @@ def main():
                           leave=False, dynamic_ncols=True)
 
         for batch_idx, batch in enumerate(batch_pbar):
-            accumulated_loss = 0.0
-
             for i in range(len(batch["_enc_ids"])):
                 enc_ids = batch["_enc_ids"][i]
                 enc_mask = batch["_enc_mask"][i]
@@ -825,7 +848,7 @@ def main():
                         # MSE against known style vectors
                         loss_ttl = F.mse_loss(style_ttl_pred, style_ttl_true)
                         loss_dp = F.mse_loss(style_dp_pred, style_dp_true)
-                        loss_style = loss_ttl + loss_dp
+                        loss_style = args.lambda_style_ttl * loss_ttl + args.lambda_style_dp * loss_dp
                         sample_total_loss = sample_total_loss + loss_style
                         sample_num_styles += 1
 
@@ -864,7 +887,6 @@ def main():
                 else:
                     loss.backward()
 
-                accumulated_loss += loss.item() * args.grad_accum_steps
                 epoch_steps += 1
 
             # Gradient accumulation step
@@ -893,8 +915,6 @@ def main():
                         **({"dur": f"{epoch_metrics['loss_dur'] / synth_denom:.4f}"} if args.lambda_dur > 0 else {}),
                         "skip": epoch_samples_skipped,
                     }, refresh=False)
-
-                accumulated_loss = 0.0
 
         batch_pbar.close()
 
@@ -1042,7 +1062,7 @@ def run_validation(
             loss_style_dp = F.mse_loss(style_dp_pred, style_dp_true)
             total_ttl += loss_style_ttl.item()
             total_dp += loss_style_dp.item()
-            total_style += (loss_style_ttl + loss_style_dp).item()
+            total_style += (args.lambda_style_ttl * loss_style_ttl + args.lambda_style_dp * loss_style_dp).item()
             count += 1
 
     encoder.train()
