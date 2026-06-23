@@ -582,6 +582,10 @@ def main():
                         help="Weight for style_ttl MSE loss (voice character)")
     parser.add_argument("--lambda_style_dp", type=float, default=1.0,
                         help="Weight for style_dp MSE loss (speaking rate)")
+    parser.add_argument("--lambda_mel", type=float, default=1.0,
+                        help="Weight for mel-spectrogram loss in real-audio path")
+    parser.add_argument("--lambda_real_dur", type=float, default=1.0,
+                        help="Weight for duration loss in real-audio path")
     parser.add_argument("--num_styles_per_train_step", type=str, default="1",
                         help="Number of training styles per sample: int (e.g. '3') or 'all'. "
                              "Default: 1 (random single style, original behavior)")
@@ -804,7 +808,7 @@ def main():
                             style_ttl_pred, style_dp_pred, audio_tts,
                             total_steps=args.total_steps, speed=args.speed,
                         )
-                        loss = loss_mel + loss_dur
+                        loss = args.lambda_mel * loss_mel + args.lambda_real_dur * loss_dur
                         epoch_metrics["loss_style"] += loss.item()
                         epoch_metrics["loss_style_ttl"] += loss_mel.item()
                         epoch_metrics["loss_style_dp"] += loss_dur.item()
