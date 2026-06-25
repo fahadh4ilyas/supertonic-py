@@ -29,6 +29,7 @@ services:
       - SUPERTONIC_INTRA_OP_THREADS=${SUPERTONIC_INTRA_OP_THREADS:-}
       - SUPERTONIC_INTER_OP_THREADS=${SUPERTONIC_INTER_OP_THREADS:-}
       - SUPERTONIC_MODEL_REVISION=${SUPERTONIC_MODEL_REVISION:-}
+      - SUPERTONIC_FILTER_CHARS=${SUPERTONIC_FILTER_CHARS:-0}
       - SUPERTONIC_CUSTOM_VOICES_DIR=/cache/supertonic/speakers
     volumes:
       # ── Model cache (persisted across container restarts) ──

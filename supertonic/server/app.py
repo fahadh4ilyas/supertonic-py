@@ -119,6 +119,7 @@ class ServerState:
         "tts",
         "use_onnx",
         "device",
+        "filter_chars",
         "custom_styles",
         "custom_styles_dir",
         "synth_lock",
@@ -132,6 +133,7 @@ class ServerState:
         tts: Optional["TTS"] = None,
         use_onnx: bool = True,
         device: Optional[str] = None,
+        filter_chars: bool = False,
         custom_styles_dir: Optional[Path] = None,
         custom_styles: Optional[Dict[str, Path]] = None,
     ) -> None:
@@ -139,6 +141,7 @@ class ServerState:
         self.tts = tts
         self.use_onnx = use_onnx
         self.device = device
+        self.filter_chars = filter_chars
         # Custom styles default to the *model's* cache dir, so the same name
         # cannot collide across model versions.
         self.custom_styles_dir = (
@@ -157,6 +160,7 @@ def create_app(
     model: str = DEFAULT_MODEL,
     use_onnx: bool = True,
     device: Optional[str] = None,
+    filter_chars: bool = False,
     custom_styles_dir: Optional[Path] = None,
     cors_origins: Optional[Iterable[str]] = None,
 ) -> FastAPI:
@@ -171,6 +175,8 @@ def create_app(
             If False, use PyTorch :class:`supertonic.model.SupertonicModel`.
         device: Torch device for PyTorch backend (e.g. ``"cuda"``, ``"cpu"``).
             Only used when ``use_onnx=False``. Default ``None`` keeps on CPU.
+        filter_chars: If True, silently drop characters unsupported by the model
+            during tokenization instead of raising an error.
         custom_styles_dir: Override the on-disk location of user-imported
             voice styles. Defaults to
             :func:`supertonic.server.styles_store.default_custom_styles_dir`.
@@ -180,7 +186,7 @@ def create_app(
     """
     if state is None:
         state = ServerState(model=model, custom_styles_dir=custom_styles_dir,
-                            use_onnx=use_onnx, device=device)
+                            use_onnx=use_onnx, device=device, filter_chars=filter_chars)
     elif custom_styles_dir is not None:
         state.custom_styles_dir = Path(custom_styles_dir)
 
@@ -189,16 +195,17 @@ def create_app(
         if state.tts is None:
             if state.use_onnx:
                 from ..pipeline import TTS
-                logger.info("Loading TTS model %r (ONNX)...", state.model)
-                state.tts = TTS(model=state.model)
+                logger.info("Loading TTS model %r (ONNX, filter_chars=%s)...",
+                            state.model, state.filter_chars)
+                state.tts = TTS(model=state.model, filter_chars=state.filter_chars)
             else:
                 from ..model import SupertonicModel
                 from ..loader import get_cache_dir
-                logger.info("Loading TTS model %r (PyTorch, device=%s)...",
-                            state.model, state.device or "cpu")
+                logger.info("Loading TTS model %r (PyTorch, device=%s, filter_chars=%s)...",
+                            state.model, state.device or "cpu", state.filter_chars)
                 model_dir = get_cache_dir(state.model)
                 state.tts = SupertonicModel.from_pretrained(
-                    str(model_dir), device=state.device,
+                    str(model_dir), device=state.device, filter_chars=state.filter_chars,
                 )
                 if state.tts.has_encoder():
                     include_voice_routes(app)

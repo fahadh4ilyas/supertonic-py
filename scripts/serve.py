@@ -41,6 +41,7 @@ def create_app():
     cors_origins = [o.strip() for o in cors_raw.split(",") if o.strip()] if cors_raw else None
     custom_styles_raw = os.environ.get("SUPERTONIC_SERVE_CUSTOM_STYLES_DIR", "")
     custom_styles_dir = Path(custom_styles_raw) if custom_styles_raw else None
+    filter_chars = os.environ.get("SUPERTONIC_FILTER_CHARS", "0") == "1"
 
     return _create_app(
         model=os.environ.get("SUPERTONIC_SERVE_MODEL", "supertonic-3"),
@@ -48,6 +49,7 @@ def create_app():
         device=os.environ.get("SUPERTONIC_SERVE_DEVICE") or None,
         cors_origins=cors_origins,
         custom_styles_dir=custom_styles_dir,
+        filter_chars=filter_chars,
     )
 
 
@@ -105,6 +107,12 @@ Examples:
         default=None,
         help="Directory for user-imported voice style JSONs",
     )
+    parser.add_argument(
+        "--filter-chars",
+        action="store_true",
+        default=False,
+        help="Silently drop unsupported characters during tokenization instead of raising an error.",
+    )
 
     # ---- uvicorn flags ----
     parser.add_argument(
@@ -148,6 +156,8 @@ Examples:
         os.environ["SUPERTONIC_SERVE_CORS"] = args.cors
     if args.custom_styles_dir:
         os.environ["SUPERTONIC_SERVE_CUSTOM_STYLES_DIR"] = args.custom_styles_dir
+    if args.filter_chars:
+        os.environ["SUPERTONIC_FILTER_CHARS"] = "1"
 
     # ---- Print startup info ----
     print(f"supertonic serve listening on http://{args.host}:{args.port}")

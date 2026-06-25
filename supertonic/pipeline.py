@@ -95,6 +95,7 @@ class TTS:
         auto_download: bool = True,
         intra_op_num_threads: Optional[int] = None,
         inter_op_num_threads: Optional[int] = None,
+        filter_chars: bool = False,
     ):
         """Initialize the TTS engine.
 
@@ -109,6 +110,8 @@ class TTS:
             inter_op_num_threads: Number of threads for inter-op parallelism.
                 If None (default), ONNX Runtime automatically determines optimal value based on your system.
                 Can also be set via SUPERTONIC_INTER_OP_THREADS environment variable
+            filter_chars: If True, silently drop characters unsupported by the model
+                during tokenization instead of raising an error.
         """
         # Validate model name
         if model not in AVAILABLE_MODELS:
@@ -126,7 +129,8 @@ class TTS:
             model_dir = Path(model_dir)
 
         self.model = load_model(
-            model_dir, auto_download, intra_op_num_threads, inter_op_num_threads, model
+            model_dir, auto_download, intra_op_num_threads, inter_op_num_threads, model,
+            filter_chars=filter_chars,
         )
         self.model_dir = model_dir
         self.sample_rate = self.model.sample_rate
@@ -254,10 +258,12 @@ class TTS:
         if silence_duration < 0:
             raise ValueError(f"silence_duration must be non-negative, got {silence_duration}")
 
-        # Validate text characters if verbose
-        is_valid, unsupported = self.model.text_processor.validate_text(text)
-        if not is_valid:
-            raise ValueError(f"Found {len(unsupported)} unsupported character(s): {unsupported}")
+        # Validate text characters — skip if filter_chars is enabled (unsupported
+        # chars will be silently dropped at tokenization time instead).
+        if not self.model.text_processor.filter_chars:
+            is_valid, unsupported = self.model.text_processor.validate_text(text)
+            if not is_valid:
+                raise ValueError(f"Found {len(unsupported)} unsupported character(s): {unsupported}")
 
         # Determine max_chunk_length based on language if not specified
         if max_chunk_length is None:

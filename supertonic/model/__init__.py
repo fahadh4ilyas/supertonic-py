@@ -101,6 +101,7 @@ class SupertonicModel(nn.Module):
         unicode_indexer: str | Path | None = None,
         model_dir: str | Path | None = None,
         device: str | torch.device | None = None,
+        filter_chars: bool = False,
     ):
         super().__init__()
 
@@ -109,6 +110,7 @@ class SupertonicModel(nn.Module):
         self.unicode_indexer: Path | None = Path(unicode_indexer) if unicode_indexer is not None else None
         self.model_dir: Path | None = Path(model_dir) if model_dir is not None else None
         self._text_processor: UnicodeProcessor | None = None
+        self._filter_chars = filter_chars
 
         # Resolve config
         if isinstance(config, (str, Path)):
@@ -171,7 +173,8 @@ class SupertonicModel(nn.Module):
                     "unicode_indexer not set on model. Pass it to __init__ or "
                     "set model.unicode_indexer to a path to unicode_indexer.json."
                 )
-            self._text_processor = UnicodeProcessor(str(self.unicode_indexer))
+            self._text_processor = UnicodeProcessor(str(self.unicode_indexer),
+                                                     filter_chars=self._filter_chars)
         return self._text_processor
 
     def forward(
@@ -346,12 +349,14 @@ class SupertonicModel(nn.Module):
         if not text or not text.strip():
             raise ValueError("Text cannot be empty")
 
-        # Validate text — reject unsupported characters early (matches ONNX pipeline)
-        is_valid, unsupported = self.text_processor.validate_text(text)
-        if not is_valid:
-            raise ValueError(
-                f"Found {len(unsupported)} unsupported character(s): {unsupported}"
-            )
+        # Validate text — reject unsupported characters early (matches ONNX pipeline).
+        # Skip when filter_chars is enabled (unsupported chars are silently dropped).
+        if not self._filter_chars:
+            is_valid, unsupported = self.text_processor.validate_text(text)
+            if not is_valid:
+                raise ValueError(
+                    f"Found {len(unsupported)} unsupported character(s): {unsupported}"
+                )
 
         if max_chunk_length is None:
             max_chunk_length = 120 if lang == "ko" else 300
@@ -436,12 +441,14 @@ class SupertonicModel(nn.Module):
         if not text or not text.strip():
             raise ValueError("Text cannot be empty")
 
-        # Validate text — reject unsupported characters early (matches ONNX pipeline)
-        is_valid, unsupported = self.text_processor.validate_text(text)
-        if not is_valid:
-            raise ValueError(
-                f"Found {len(unsupported)} unsupported character(s): {unsupported}"
-            )
+        # Validate text — reject unsupported characters early (matches ONNX pipeline).
+        # Skip when filter_chars is enabled (unsupported chars are silently dropped).
+        if not self._filter_chars:
+            is_valid, unsupported = self.text_processor.validate_text(text)
+            if not is_valid:
+                raise ValueError(
+                    f"Found {len(unsupported)} unsupported character(s): {unsupported}"
+                )
 
         if max_chunk_length is None:
             max_chunk_length = 120 if lang == "ko" else 300
@@ -563,6 +570,7 @@ class SupertonicModel(nn.Module):
     @classmethod
     def from_pretrained(
         cls, model_dir: str | Path, device: str | torch.device | None = None,
+        filter_chars: bool = False,
     ) -> "SupertonicModel":
         """Load model from a directory created by save_pretrained.
 
@@ -570,6 +578,8 @@ class SupertonicModel(nn.Module):
             model_dir: Path to directory containing tts.json and model.safetensors.
             device: Torch device to place the model on (e.g. ``"cuda"``, ``"cpu"``).
                 Default ``None`` keeps weights on CPU.
+            filter_chars: If True, silently drop characters unsupported by the model
+                during tokenization instead of raising an error.
 
         Returns:
             SupertonicModel with pretrained weights loaded.
@@ -585,7 +595,8 @@ class SupertonicModel(nn.Module):
         indexer_path = model_dir / "unicode_indexer.json"
         unicode_indexer = indexer_path if indexer_path.exists() else None
 
-        model = cls(config=config, unicode_indexer=unicode_indexer, model_dir=model_dir, device=device)
+        model = cls(config=config, unicode_indexer=unicode_indexer, model_dir=model_dir,
+                     device=device, filter_chars=filter_chars)
 
         # Load weights
         state = safetensors.torch.load_file(str(model_dir / "model.safetensors"))
