@@ -238,7 +238,7 @@ def _parse_env_int(env_var: str, default: Optional[int] = None) -> Optional[int]
         Parsed integer or default value
     """
     value = os.getenv(env_var)
-    if value is None:
+    if value is None or value.strip() == "":
         return default
     try:
         return int(value)
