@@ -346,6 +346,13 @@ class SupertonicModel(nn.Module):
         if not text or not text.strip():
             raise ValueError("Text cannot be empty")
 
+        # Validate text — reject unsupported characters early (matches ONNX pipeline)
+        is_valid, unsupported = self.text_processor.validate_text(text)
+        if not is_valid:
+            raise ValueError(
+                f"Found {len(unsupported)} unsupported character(s): {unsupported}"
+            )
+
         if max_chunk_length is None:
             max_chunk_length = 120 if lang == "ko" else 300
 
@@ -428,6 +435,13 @@ class SupertonicModel(nn.Module):
             )
         if not text or not text.strip():
             raise ValueError("Text cannot be empty")
+
+        # Validate text — reject unsupported characters early (matches ONNX pipeline)
+        is_valid, unsupported = self.text_processor.validate_text(text)
+        if not is_valid:
+            raise ValueError(
+                f"Found {len(unsupported)} unsupported character(s): {unsupported}"
+            )
 
         if max_chunk_length is None:
             max_chunk_length = 120 if lang == "ko" else 300
