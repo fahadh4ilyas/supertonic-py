@@ -280,11 +280,13 @@ def load_onnx_modules(
     return dp_ort, text_enc_ort, vector_est_ort, vocoder_ort
 
 
-def load_text_processor(model_dir: Union[Path, str]) -> UnicodeProcessor:
+def load_text_processor(model_dir: Union[Path, str], filter_chars: bool = False) -> UnicodeProcessor:
     """Load the unicode text processor for the model.
 
     Args:
         model_dir: Directory containing the model files (str or Path)
+        filter_chars: If True, silently drop characters whose unicode index is -1
+            (unsupported by the model) instead of passing -1 token IDs.
 
     Returns:
         Initialized UnicodeProcessor instance
@@ -292,7 +294,7 @@ def load_text_processor(model_dir: Union[Path, str]) -> UnicodeProcessor:
     model_dir = Path(model_dir) if isinstance(model_dir, str) else model_dir
     unicode_indexer_path = model_dir / UNICODE_INDEXER_REL_PATH
     logger.debug(f"Loading text processor from {unicode_indexer_path}")
-    text_processor = UnicodeProcessor(str(unicode_indexer_path))
+    text_processor = UnicodeProcessor(str(unicode_indexer_path), filter_chars=filter_chars)
     return text_processor
 
 
@@ -302,6 +304,7 @@ def load_model(
     intra_op_num_threads: Optional[int] = None,
     inter_op_num_threads: Optional[int] = None,
     model_name: Optional[str] = None,
+    filter_chars: bool = False,
 ) -> Supertonic:
     """Load the complete Supertonic TTS model.
 
@@ -318,6 +321,8 @@ def load_model(
             None (default) lets ONNX Runtime auto-detect optimal value
         model_name: Model name (one of ``AVAILABLE_MODELS``).
             Used for downloading the correct model if auto_download is True.
+        filter_chars: If True, silently drop characters whose unicode index is -1
+            (unsupported by the model) during tokenization.
 
     Returns:
         Initialized Supertonic TTS engine
@@ -339,7 +344,7 @@ def load_model(
     dp_ort, text_enc_ort, vector_est_ort, vocoder_ort = load_onnx_modules(
         model_dir, intra_op_num_threads, inter_op_num_threads
     )
-    text_processor = load_text_processor(model_dir)
+    text_processor = load_text_processor(model_dir, filter_chars=filter_chars)
 
     logger.info("Model loaded successfully")
     return Supertonic(cfgs, text_processor, dp_ort, text_enc_ort, vector_est_ort, vocoder_ort)

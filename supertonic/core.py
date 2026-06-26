@@ -115,9 +115,10 @@ class UnicodeProcessor:
         unicode_indexer_path: Path to the unicode indexer JSON file
     """
 
-    def __init__(self, unicode_indexer_path: str):
+    def __init__(self, unicode_indexer_path: str, filter_chars: bool = False):
         self.indexer = self._load_indexer(unicode_indexer_path)
         self.supported_chars = self._make_supported_characters()
+        self.filter_chars = filter_chars
 
     def _load_indexer(self, unicode_indexer_path: str) -> list:
         try:
@@ -342,13 +343,27 @@ class UnicodeProcessor:
                 - text_mask: Array of shape (batch_size, 1, max_length) with attention mask
         """
         preprocessed_texts = [self._preprocess_text(t, lang) for t in text_list]
-        text_ids_lengths = np.array([len(text) for text in preprocessed_texts], dtype=np.int64)
-        text_ids = np.zeros((len(preprocessed_texts), text_ids_lengths.max()), dtype=np.int64)
-        for i, text in enumerate(preprocessed_texts):
-            unicode_vals = self._text_to_unicode_values(text)
-            text_ids[i, : len(unicode_vals)] = np.array(
-                [self.indexer[val] for val in unicode_vals], dtype=np.int64
-            )
+        if self.filter_chars:
+            text_ids_out = []
+            text_ids_lengths_list = []
+            for text in preprocessed_texts:
+                unicode_vals = self._text_to_unicode_values(text)
+                ids = [self.indexer[val] for val in unicode_vals if self.indexer[val] != -1]
+                text_ids_out.append(ids)
+                text_ids_lengths_list.append(len(ids))
+            text_ids_lengths = np.array(text_ids_lengths_list, dtype=np.int64)
+            max_len = max(text_ids_lengths_list) if text_ids_lengths_list else 0
+            text_ids = np.zeros((len(preprocessed_texts), max_len), dtype=np.int64)
+            for i, ids in enumerate(text_ids_out):
+                text_ids[i, :len(ids)] = ids
+        else:
+            text_ids_lengths = np.array([len(text) for text in preprocessed_texts], dtype=np.int64)
+            text_ids = np.zeros((len(preprocessed_texts), text_ids_lengths.max()), dtype=np.int64)
+            for i, text in enumerate(preprocessed_texts):
+                unicode_vals = self._text_to_unicode_values(text)
+                text_ids[i, : len(unicode_vals)] = np.array(
+                    [self.indexer[val] for val in unicode_vals], dtype=np.int64
+                )
         text_mask = self._get_text_mask(text_ids_lengths)
         return text_ids, text_mask
 

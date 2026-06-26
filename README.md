@@ -251,6 +251,83 @@ related work together, not about parallel speed-up. Any per-item failure
 returns a `400` with `items[<index>]` in the error message — no audio is
 emitted partially.
 
+### Voice management (PyTorch backend)
+
+The PyTorch backend (`--no-use-onnx`) supports uploading and deleting voices
+when the `AudioEncoder` has been trained.  Uploaded voices are stored as
+safetensors files and persist across restarts.
+
+**Upload** a voice sample (requires trained AudioEncoder):
+
+```bash
+curl -X POST http://127.0.0.1:7788/v1/audio/voices \
+  -F "audio_sample=@/path/to/reference.wav" \
+  -F "consent=speaker_consent" \
+  -F "name=my_voice" \
+  -F "speaker_description=warm narrator"
+```
+
+**Delete** an uploaded voice:
+
+```bash
+curl -X DELETE http://127.0.0.1:7788/v1/audio/voices/my_voice
+```
+
+**List** all built-in, imported, and uploaded voices:
+
+```bash
+curl http://127.0.0.1:7788/v1/audio/voices
+```
+
+### WebSocket streaming
+
+`/v1/audio/speech/stream` accepts text incrementally over a WebSocket and
+streams PCM audio back per sentence as it is generated:
+
+```python
+import asyncio, aiohttp, json, wave
+
+async def stream_tts():
+    uri = "ws://127.0.0.1:7788/v1/audio/speech/stream"
+    voice = "F1"
+    filename = f"output_stream_{voice}.wav"
+
+    with wave.open(filename, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(uri) as ws:
+                async def receive(ws, wav_file):
+                    has_sample_rate = False
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.BINARY:
+                            wav_file.writeframes(msg.data)
+                        elif msg.type == aiohttp.WSMsgType.TEXT:
+                            data = json.loads(msg.data)
+                            if data.get("type") == "audio.start" and not has_sample_rate:
+                                wav_file.setframerate(data.get("sample_rate", 44100))
+                                has_sample_rate = True
+                            elif data.get("type") == "session.done":
+                                return
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            return
+
+                recv_task = asyncio.create_task(receive(ws, wav_file))
+                await ws.send_json({"type": "session.config", "voice": voice,
+                                    "stream_audio": True, "response_format": "pcm"})
+                await ws.send_json({"type": "input.text",
+                                    "text": "Hello! This is streaming TTS."})
+                await ws.send_json({"type": "input.done"})
+                await recv_task
+
+asyncio.run(stream_tts())
+```
+
+Session config supports `voice`, `language`, `speed`, `stream_audio`, and
+`response_format`.  Audio is returned as raw 16-bit PCM chunks at the model's
+native sample rate (44.1 kHz).
+
 ## Requirements
 
 Supertonic has **minimal dependencies** - just 4 core libraries:
@@ -259,6 +336,74 @@ Supertonic has **minimal dependencies** - just 4 core libraries:
 - **numpy** - Numerical operations
 - **soundfile** - Audio file I/O
 - **huggingface-hub** - Model downloads
+
+
+## PyTorch Backend
+
+Supertonic includes a **trainable PyTorch implementation** of all sub-models
+(`DurationPredictor`, `TextEncoder`, `VectorField`, `Vocoder`, `AudioEncoder`)
+alongside the default ONNX runtime.  This enables:
+
+- **Fine-tuning** on custom voices or domains
+- **Voice cloning** via `AudioEncoder` — extract style vectors from reference
+  audio and generate speech in that voice
+- **Full end-to-end training** of the TTS pipeline
+
+### PyTorch Inference (no ONNX)
+
+```python
+from supertonic.model import SupertonicModel
+
+model = SupertonicModel.from_pretrained("~/.cache/supertonic3/", device="cpu")
+style = model.get_voice_style("M1")
+wav, dur = model.synthesize("Hello world.", voice_style=style)
+```
+
+### Run the server with PyTorch
+
+```bash
+python scripts/serve.py --host 0.0.0.0 --port 7788 --no-use-onnx --device cuda --cors "*"
+```
+
+The PyTorch backend supports voice upload (`POST /v1/audio/voices`) when the
+`AudioEncoder` has been trained.  See the scripts below for training commands.
+
+
+## Scripts
+
+The `scripts/` directory contains standalone tools for training, exporting,
+and serving:
+
+| Script | Description |
+|--------|-------------|
+| `serve.py` | Standalone uvicorn runner with full CLI control (reload, workers, CORS) |
+| `train_encoder.py` | Train the `AudioEncoder` for voice cloning from reference audio |
+| `train_tts.py` | Train / fine-tune the full TTS model end-to-end |
+| `export_onnx.py` | Export PyTorch model → ONNX |
+| `load_onnx_weights.py` | Load ONNX weights into the PyTorch model |
+| `merge_encoder.py` | Merge a trained AudioEncoder checkpoint into a model |
+| `generate_dataset.py` | Generate training datasets from text |
+| `generate_wav.py` | Batch synthesis from a text file |
+
+Usage examples:
+
+```bash
+# Train AudioEncoder for voice cloning
+python scripts/train_encoder.py \
+  --dataset data_train.jsonl \
+  --output_dir ./checkpoints \
+  --device cuda --epochs 50
+
+# Train / fine-tune the full TTS model
+python scripts/train_tts.py \
+  --dataset data_train.jsonl \
+  --output_dir ./checkpoints \
+  --device cuda --epochs 50
+
+# Export trained model to ONNX
+python scripts/export_onnx.py \
+  --input-dir ./checkpoints --output-dir ./exported_onnx
+```
 
 
 ## ✨ Highlights
@@ -297,6 +442,58 @@ Supertonic-3 supports the following 31 ISO codes, plus a special `na` fallback f
 wav, _ = tts.synthesize("Some uncommon text.", voice_style=style, lang="na")
 ```
 
+
+
+## Docker
+
+Pre-built `Dockerfile` and `docker-compose.yaml` for running `supertonic serve`
+in a container with persistent model caching.
+
+### Quick start
+
+```bash
+cd docker
+docker compose up -d --build
+```
+
+The server listens on `http://localhost:7788`. Model cache is stored in a
+named volume (`supertonic_cache`) so it survives container rebuilds.
+
+### CPU vs GPU
+
+The base image is controlled by a build arg — swap it for GPU support:
+
+```bash
+# CPU (default)
+docker compose up -d --build
+
+# GPU — uncomment BASE_IMAGE and deploy section in docker-compose.yaml, then:
+docker compose build --build-arg BASE_IMAGE=nvidia/cuda:12.1-runtime-ubuntu22.04
+docker compose up -d
+```
+
+### Environment variables
+
+All `SUPERTONIC_*` variables are passed through from the host or a `.env` file:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SUPERTONIC_SERVE_MODEL` | `supertonic-3` | Model to load |
+| `SUPERTONIC_SERVE_USE_ONNX` | `1` | `1` = ONNX, `0` = PyTorch |
+| `SUPERTONIC_SERVE_WORKERS` | `1` | Number of uvicorn workers |
+| `SUPERTONIC_SERVE_DEVICE` | (empty) | Torch device for PyTorch (`cuda`, `cpu`) |
+| `SUPERTONIC_SERVE_CORS` | (empty) | Comma-separated CORS origins |
+| `SUPERTONIC_LOG_LEVEL` | `INFO` | Logging level |
+| `SUPERTONIC_INTRA_OP_THREADS` | (empty) | ONNX intra-op threads |
+| `SUPERTONIC_INTER_OP_THREADS` | (empty) | ONNX inter-op threads |
+
+### Volumes
+
+| Mount | Purpose |
+|-------|---------|
+| `supertonic_cache:/cache/supertonic` | Model cache (persistent named volume) |
+| `~/.cache/supertonic:/host_cache/supertonic:ro` | Host cache read-only fallback |
+| `~/.cache/supertonic/speakers:/cache/supertonic/speakers` | Uploaded custom voices |
 
 
 ## Performance

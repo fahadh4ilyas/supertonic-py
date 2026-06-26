@@ -6,3 +6,15 @@ onnxruntime>=1.20.0; python_version >= "3.13"
 numpy>=1.21.0
 soundfile>=0.10.0
 huggingface-hub>=0.10.0
+torch>=2.9.1
+torchaudio>=2.9.1
+
+# PyTorch model serialization
+safetensors>=0.4.0
+
+# ONNX export and inspection
+onnx>=1.16.0
+onnxscript>=0.1.0
+
+# Testing
+pytest>=7.0.0

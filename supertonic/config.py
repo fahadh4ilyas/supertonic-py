@@ -98,6 +98,18 @@ def get_model_cache_dir(model_name: str) -> Path:
     return Path.home() / ".cache" / config["cache_dir"]
 
 
+def get_custom_voices_dir() -> Path:
+    """Get the directory for uploaded/custom voice styles.
+
+    Override with ``SUPERTONIC_CUSTOM_VOICES_DIR`` env var.
+    Defaults to ``~/.cache/supertonic/speakers``.
+    """
+    env = os.environ.get("SUPERTONIC_CUSTOM_VOICES_DIR")
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / ".cache" / "supertonic" / "speakers"
+
+
 def get_model_repo(model_name: str) -> str:
     """Get HuggingFace repo ID for a specific model.
 
@@ -226,7 +238,7 @@ def _parse_env_int(env_var: str, default: Optional[int] = None) -> Optional[int]
         Parsed integer or default value
     """
     value = os.getenv(env_var)
-    if value is None:
+    if value is None or value.strip() == "":
         return default
     try:
         return int(value)

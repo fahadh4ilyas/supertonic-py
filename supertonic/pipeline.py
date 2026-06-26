@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Optional, Union
 
@@ -94,6 +95,7 @@ class TTS:
         auto_download: bool = True,
         intra_op_num_threads: Optional[int] = None,
         inter_op_num_threads: Optional[int] = None,
+        filter_chars: bool = False,
     ):
         """Initialize the TTS engine.
 
@@ -108,6 +110,8 @@ class TTS:
             inter_op_num_threads: Number of threads for inter-op parallelism.
                 If None (default), ONNX Runtime automatically determines optimal value based on your system.
                 Can also be set via SUPERTONIC_INTER_OP_THREADS environment variable
+            filter_chars: If True, silently drop characters unsupported by the model
+                during tokenization instead of raising an error.
         """
         # Validate model name
         if model not in AVAILABLE_MODELS:
@@ -125,7 +129,8 @@ class TTS:
             model_dir = Path(model_dir)
 
         self.model = load_model(
-            model_dir, auto_download, intra_op_num_threads, inter_op_num_threads, model
+            model_dir, auto_download, intra_op_num_threads, inter_op_num_threads, model,
+            filter_chars=filter_chars,
         )
         self.model_dir = model_dir
         self.sample_rate = self.model.sample_rate
@@ -253,10 +258,12 @@ class TTS:
         if silence_duration < 0:
             raise ValueError(f"silence_duration must be non-negative, got {silence_duration}")
 
-        # Validate text characters if verbose
-        is_valid, unsupported = self.model.text_processor.validate_text(text)
-        if not is_valid:
-            raise ValueError(f"Found {len(unsupported)} unsupported character(s): {unsupported}")
+        # Validate text characters — skip if filter_chars is enabled (unsupported
+        # chars will be silently dropped at tokenization time instead).
+        if not self.model.text_processor.filter_chars:
+            is_valid, unsupported = self.model.text_processor.validate_text(text)
+            if not is_valid:
+                raise ValueError(f"Found {len(unsupported)} unsupported character(s): {unsupported}")
 
         # Determine max_chunk_length based on language if not specified
         if max_chunk_length is None:
@@ -327,6 +334,123 @@ class TTS:
             print(f"Array shape: {wav_cat.shape}")
 
         return wav_cat, dur_cat
+    
+    def synthesize_generator(
+        self,
+        text: str,
+        voice_style: Style,
+        total_steps: int = DEFAULT_TOTAL_STEPS,
+        speed: float = DEFAULT_SPEED,
+        max_chunk_length: Optional[int] = None,
+        silence_duration: float = DEFAULT_SILENCE_DURATION,
+        lang: Optional[str] = None,
+        verbose: bool = False,
+    ):
+        """Synthesize speech from text and yield audio chunks on the fly.
+
+        This method chunks long text and yields the waveform for each chunk 
+        as soon as it is generated, making it ideal for real-time streaming.
+
+        Args:
+            text: Text to synthesize
+            voice_style: Voice style object
+            total_steps: Number of synthesis steps (default: 8)
+            speed: Speech speed multiplier (default: 1.05)
+            max_chunk_length: Max characters per chunk. If None, automatically
+                determined based on language (300 for most, 120 for Korean)
+            silence_duration: Silence between chunks in seconds (default: 0.3)
+            lang: Language code for synthesis. If ``None`` (default), the
+                code is resolved from the loaded model.
+            verbose: If True, print detailed progress information (default: False)
+
+        Yields:
+            Tuple of (waveform, duration) for each processed chunk.
+        """
+        if not text or not text.strip():
+            raise ValueError("Text cannot be empty")
+
+        if lang is None:
+            lang = UNKNOWN_LANGUAGE if self.is_multilingual else DEFAULT_LANGUAGE
+
+        if self.is_multilingual:
+            if lang not in AVAILABLE_LANGUAGES:
+                raise ValueError(
+                    f"Invalid language: '{lang}'. "
+                    f"Supported languages: {', '.join(AVAILABLE_LANGUAGES)}"
+                )
+            effective_lang: Optional[str] = lang
+        else:
+            if lang != "en" and verbose:
+                print(f"⚠️  Model '{self.model_name}' is English-only. Ignoring lang='{lang}'.")
+            effective_lang = None
+
+        if len(text) > MAX_TEXT_LENGTH:
+            raise ValueError(
+                f"Text length ({len(text)}) exceeds maximum allowed length "
+                f"({MAX_TEXT_LENGTH}). Please split your text into smaller chunks."
+            )
+
+        if not isinstance(voice_style, Style):
+            raise TypeError(
+                f"voice_style must be a Style object, got {type(voice_style).__name__}. "
+                f"Use get_voice_style() to load a style."
+            )
+
+        is_valid, unsupported = self.model.text_processor.validate_text(text)
+        if not is_valid:
+            raise ValueError(f"Found {len(unsupported)} unsupported character(s): {unsupported}")
+
+        if max_chunk_length is None:
+            max_chunk_length = (
+                DEFAULT_MAX_CHUNK_LENGTH_KO if effective_lang == "ko" else DEFAULT_MAX_CHUNK_LENGTH
+            )
+
+        text_chunks = chunk_text(text, max_chunk_length)
+
+        if verbose:
+            print(f"Split into {len(text_chunks)} chunk(s) for generator stream")
+
+        # Pre-allocate silence array if needed
+        silence_wav = None
+        silence_wav_half = None
+        if silence_duration > 0:
+            silence_wav = np.zeros((1, int(silence_duration * self.sample_rate)), dtype=np.float32)
+            silence_wav_half = np.zeros((1, int(silence_duration * self.sample_rate / 2.0)), dtype=np.float32)
+
+        for i, text_chunk in enumerate(text_chunks):
+            logger.debug(f"Processing chunk {i+1}/{len(text_chunks)}")
+            
+            # Generate the current chunk
+            wav, dur_onnx = self.model(
+                [text_chunk], voice_style, total_steps, speed, effective_lang
+            )
+
+            if wav.shape[0] != 1:
+                raise RuntimeError(f"Expected wav shape (1, samples), got {wav.shape}")
+
+            audio = wav[0]
+            active_speech = np.where(np.abs(audio) > 0.002)[0]
+            
+            if len(active_speech) > 0:
+                margin = int(self.sample_rate * 0.04)  # 40ms buffer
+                start = max(0, active_speech[0] - margin)
+                end = min(len(audio), active_speech[-1] + margin)
+                wav = wav[:, start:end]
+
+            chunk_wav = wav
+            chunk_dur = dur_onnx
+
+            # Append silence if it's not the last chunk
+            if silence_wav is not None:
+                if re.search(r'[,，]["\')\]]*$', text_chunk.strip()):
+                    chunk_wav = np.concatenate([wav, silence_wav_half], axis=1)
+                    chunk_dur = dur_onnx + silence_duration / 2.0
+                else:
+                    chunk_wav = np.concatenate([wav, silence_wav], axis=1)
+                    chunk_dur = dur_onnx + silence_duration
+
+            # Yield the chunk immediately before processing the next one
+            yield chunk_wav, chunk_dur
 
     def save_audio(
         self,

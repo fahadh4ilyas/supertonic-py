@@ -17,19 +17,26 @@ so that downstream error parsers keep working.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import io
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Optional, TYPE_CHECKING
 
 import numpy as np
-from fastapi import APIRouter, FastAPI, File, Form, Request, Response, UploadFile
+import soundfile as sf
+import torch
+import torchaudio.functional as taF
+from fastapi import APIRouter, FastAPI, File, Form, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from .. import __version__
-from ..config import AVAILABLE_LANGUAGES
-from . import styles_store
+from ..config import AVAILABLE_LANGUAGES, DEFAULT_SILENCE_DURATION, get_custom_voices_dir
+from ..core import Style
+from . import styles_store, voice_manager
 from .audio import (
     SUPPORTED_FORMATS,
     UnsupportedAudioFormat,
@@ -83,17 +90,20 @@ def _error(status_code: int, message: str, code: str, type_: str = "invalid_requ
 
 
 def _resolve_voice(state: "ServerState", voice_name: str):
-    """Return a ``Style`` for ``voice_name`` from built-ins or imported custom styles.
-
-    Built-ins are checked first; this is structurally equivalent to checking
-    custom first because :func:`styles_store.save` refuses to write a custom
-    name that collides with the model's built-ins.
-    """
+    """Return a ``Style`` for ``voice_name`` from built-ins, uploaded, or imported styles."""
     tts = state.tts
     if tts is None:
-        raise RuntimeError("server not ready")  # caller maps to 503
+        raise RuntimeError("server not ready")
     if voice_name in tts.voice_style_names:
         return tts.get_voice_style(voice_name)
+    # Check uploaded voices (safetensors stored on disk). Works for both
+    # backends — ONNX just loads pre-extracted vectors without an encoder.
+    voices_dir = get_custom_voices_dir()
+    result = voice_manager.load_voice(voices_dir, voice_name)
+    if result is not None:
+        style_ttl_np = result[0].cpu().numpy()
+        style_dp_np = result[1].cpu().numpy()
+        return Style(style_ttl_onnx=style_ttl_np, style_dp_onnx=style_dp_np)
     custom_path = state.custom_styles.get(voice_name)
     if custom_path is not None:
         return tts.get_voice_style_from_path(custom_path)
@@ -125,11 +135,12 @@ def _do_synthesize(
     if lang is not None:
         kwargs["lang"] = lang
 
-    # ONNX Runtime sessions are not guaranteed safe under concurrent calls
-    # from threads. FastAPI executes our sync handlers in a threadpool, so we
-    # serialize here. Within-process throughput is bounded by one synth at a
-    # time — that's the right trade-off for a local helper.
-    with state.synth_lock:
+    # ONNX Runtime sessions are not thread-safe — serialize access.
+    # PyTorch handles concurrency natively, so the lock is skipped.
+    if state.use_onnx:
+        with state.synth_lock:
+            wav, _ = state.tts.synthesize(text=text, **kwargs)
+    else:
         wav, _ = state.tts.synthesize(text=text, **kwargs)
 
     return wav, duration_seconds(wav, state.tts.sample_rate)
@@ -184,7 +195,7 @@ def register_routes(app: FastAPI) -> None:
             model=state.model,
             sample_rate=state.tts.sample_rate,
             version=__version__,
-            voices_loaded=len(state.tts.voice_style_names) + len(state.custom_styles),
+            voices_loaded=len(state.tts.voice_style_names) + len(state.custom_styles) + len(voice_manager.list_voices(get_custom_voices_dir())),
         )
 
     @router.get("/v1/styles", response_model=StylesResponse)
@@ -418,4 +429,317 @@ def register_routes(app: FastAPI) -> None:
             )
         return BatchResponse(items=results)
 
+    @router.get("/v1/audio/voices")
+    def openai_compat_voices(request: Request):
+        """OpenAI/vLLM-Omni compatible endpoint to list available voices."""
+        state = _state(request)
+        if state.tts is None:
+            return _error(503, "server not ready", "not_ready", type_="server_error")
+
+        builtin_voices = list(state.tts.voice_style_names)
+        custom_voices = list(state.custom_styles.keys())
+
+        # Uploaded voices (encoder-extracted, from voice_manager)
+        uploaded_meta = voice_manager.list_voices(get_custom_voices_dir())
+        uploaded_names = [v["name"] for v in uploaded_meta]
+
+        all_voices = builtin_voices + custom_voices + uploaded_names
+
+        uploaded_voices = []
+        for name in custom_voices:
+            uploaded_voices.append({
+                "name": name,
+                "speaker_description": "Supertonic custom imported style",
+            })
+        uploaded_voices.extend(uploaded_meta)
+
+        return JSONResponse(content={
+            "voices": sorted(all_voices),
+            "uploaded_voices": uploaded_voices,
+        })
+
+    # Map friendly OpenAI language names to Supertonic ISO codes
+    LANG_MAP = {
+        "arabic": "ar",
+        "bulgarian": "bg",
+        "croatian": "hr",
+        "czech": "cs",
+        "danish": "da",
+        "dutch": "nl",
+        "english": "en",
+        "estonian": "et",
+        "finnish": "fi",
+        "french": "fr",
+        "german": "de",
+        "greek": "el",
+        "hindi": "hi",
+        "hungarian": "hu",
+        "indonesian": "id",
+        "italian": "it",
+        "japanese": "ja",
+        "korean": "ko",
+        "latvian": "lv",
+        "lithuanian": "lt",
+        "polish": "pl",
+        "portuguese": "pt",
+        "romanian": "ro",
+        "russian": "ru",
+        "slovak": "sk",
+        "slovenian": "sl",
+        "spanish": "es",
+        "swedish": "sv",
+        "turkish": "tr",
+        "ukrainian": "uk",
+        "vietnamese": "vi",
+        "auto": "na"
+    }
+
+    def _map_language(lang_str: str) -> str:
+        if not lang_str:
+            return "na"
+        lang_str_lower = lang_str.lower()
+        if lang_str_lower in LANG_MAP:
+            return LANG_MAP[lang_str_lower]
+        return lang_str
+    
+    @router.websocket("/v1/audio/speech/stream")
+    async def openai_compat_speech_stream(websocket: WebSocket):
+        await websocket.accept()
+        
+        state = websocket.app.state.server_state
+        if state.tts is None:
+            await websocket.send_json({"type": "error", "message": "server not ready"})
+            await websocket.close(code=1011)
+            return
+
+        config = {}
+        text_buffer = ""
+        sentence_queue = asyncio.Queue()
+
+        # --- BACKGROUND WORKER TASK ---
+        async def tts_worker():
+            sentence_index = 0
+            total_sentences = 0
+            try:
+                while True:
+                    # Wait for the next sentence from the queue
+                    sentence_text = await sentence_queue.get()
+                    
+                    # A 'None' value is our sentinel signal to stop the worker
+                    if sentence_text is None:
+                        break
+
+                    try:
+                        mapped_lang = _map_language(config.get("language", "auto").lower())
+
+                        if mapped_lang not in AVAILABLE_LANGUAGES:
+                            await websocket.send_json({"type": "error", "message": f"unsupported lang {mapped_lang!r}"})
+                            continue
+                            
+                        # 1. We send the start signal immediately so the frontend knows audio is coming
+                        await websocket.send_json({
+                            "type": "audio.start",
+                            "sentence_index": sentence_index,
+                            "sentence_text": sentence_text,
+                            "format": "pcm",
+                            "sample_rate": state.tts.sample_rate
+                        })
+
+                        # 2. Resolve voice (built-in, uploaded, or custom) and create generator
+                        style = _resolve_voice(state, config.get("voice", "M1"))
+
+                        if state.use_onnx:
+                            with state.synth_lock:
+                                chunk_generator = state.tts.synthesize_generator(
+                                    text=sentence_text,
+                                    voice_style=style,
+                                    lang=mapped_lang,
+                                    speed=config.get("speed", 1.0),
+                                    max_chunk_length=config.get("max_chunk_length"),
+                                    silence_duration=config.get("silence_duration", DEFAULT_SILENCE_DURATION),
+                                )
+                        else:
+                            chunk_generator = state.tts.synthesize_generator(
+                                text=sentence_text,
+                                voice_style=style,
+                                lang=mapped_lang,
+                                speed=config.get("speed", 1.0),
+                                max_chunk_length=config.get("max_chunk_length"),
+                                silence_duration=config.get("silence_duration", DEFAULT_SILENCE_DURATION),
+                            )
+
+                        total_len_pcm_data = 0
+
+                        # 3. Iterate chunks (locked for ONNX, concurrent for PyTorch)
+                        while True:
+                            if state.use_onnx:
+                                def _locked_next():
+                                    with state.synth_lock:
+                                        return next(chunk_generator, None)
+                                chunk_data = await asyncio.to_thread(_locked_next)
+                            else:
+                                chunk_data = await asyncio.to_thread(next, chunk_generator, None)
+                            
+                            if chunk_data is None:
+                                # The generator returned None, meaning this sentence is fully spoken
+                                break
+
+                            wav, dur = chunk_data
+                                
+                            # Convert the chunk and instantly send it to the WebRTC socket
+                            pcm_data = (np.clip(wav, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+                            await websocket.send_bytes(pcm_data)
+                            total_len_pcm_data += len(pcm_data)
+
+                        # 4. Notify the frontend the sentence is done
+                        await websocket.send_json({
+                            "type": "audio.done",
+                            "sentence_index": sentence_index,
+                            "total_bytes": total_len_pcm_data,
+                            "error": False
+                        })
+
+                        sentence_index += 1
+                        total_sentences += 1
+
+                    except Exception as e:
+                        logger.exception("Streaming synthesis failed")
+                        await websocket.send_json({"type": "error", "message": str(e)})
+
+                    finally:
+                        # Tell the queue we finished processing this item
+                        sentence_queue.task_done()
+                        
+                # Only send session.done after the queue is completely empty and finished
+                await websocket.send_json({
+                    "type": "session.done",
+                    "total_sentences": total_sentences
+                })
+
+            except asyncio.CancelledError:
+                # Worker was killed (e.g. client disconnected early)
+                pass
+
+
+        # Start the background worker immediately
+        worker_task = asyncio.create_task(tts_worker())
+
+        # --- MAIN WEBSOCKET LISTENER ---
+        try:
+            while True:
+                msg = await websocket.receive_json()
+                msg_type = msg.get("type")
+
+                if msg_type == "session.config":
+                    config = msg
+                    
+                elif msg_type == "input.text":
+                    text_buffer += msg.get("text", "")
+                    
+                    # Split sentences dynamically
+                    split_commas = config.get("split_commas", False)
+                    if split_commas:
+                        sentences = re.split(r'(?<=[.!?。！？,，\n])(?=\s|$)', text_buffer)
+                    else:
+                        sentences = re.split(r'(?<=[.!?。！？\n])(?=\s|$)', text_buffer)
+                    
+                    if len(sentences) > 1:
+                        for s in sentences[:-1]:
+                            if s.strip():
+                                # Instantly put the sentence in the queue instead of blocking
+                                await sentence_queue.put(s.strip())
+                        text_buffer = sentences[-1]
+                        
+                elif msg_type == "input.done":
+                    if text_buffer.strip():
+                        await sentence_queue.put(text_buffer.strip())
+                        text_buffer = ""
+                    
+                    # Send the sentinel 'None' to tell the worker we are done sending text
+                    await sentence_queue.put(None)
+                    
+        except WebSocketDisconnect:
+            logger.info("WebSocket disconnected gracefully.")
+        except Exception as e:
+            logger.error(f"WebSocket error: {e}")
+        finally:
+            # Clean up: If the client disconnects or an error occurs, kill the TTS worker
+            worker_task.cancel()
+    
+    @router.delete("/v1/audio/voices/{name}")
+    async def delete_voice(name: str, request: Request):
+        """Delete an uploaded voice."""
+        state = _state(request)
+        if state.tts is None:
+            return JSONResponse(status_code=503, content={"error": "server not ready"})
+
+        voices_dir = get_custom_voices_dir()
+        deleted = voice_manager.delete_voice(voices_dir, name)
+        if not deleted:
+            return JSONResponse(
+                status_code=404,
+                content={"success": False, "error": f"Voice '{name}' not found"},
+            )
+        return {"success": True, "message": f"Voice '{name}' deleted successfully"}
+
     app.include_router(router)
+
+
+def include_voice_routes(app: FastAPI) -> None:
+    """Include voice management routes (upload requires PyTorch+encoder; delete works for both)."""
+    voice_router = APIRouter()
+
+    @voice_router.post("/v1/audio/voices")
+    async def upload_voice(
+        request: Request,
+        audio_sample: UploadFile = File(...),
+        consent: str = Form(...),
+        name: str = Form(...),
+        ref_text: Optional[str] = Form(None),
+        speaker_description: Optional[str] = Form(None),
+    ):
+        """Upload a voice sample for voice cloning.
+
+        Requires PyTorch backend with a trained AudioEncoder.
+        """
+        state = _state(request)
+        if state.tts is None:
+            return JSONResponse(status_code=503, content={"error": "server not ready"})
+
+        audio_bytes = await audio_sample.read()
+        file_size = len(audio_bytes)
+
+        try:
+            wav, sr = sf.read(io.BytesIO(audio_bytes))
+        except Exception:
+            return JSONResponse(status_code=400, content={"error": "Unsupported audio format"})
+
+        if wav.ndim > 1:
+            wav = wav.mean(axis=1)
+
+        target_sr = state.tts.sample_rate
+        if sr != target_sr:
+            wav_t = torch.from_numpy(wav.astype(np.float32)).unsqueeze(0)
+            wav_t = taF.resample(wav_t, sr, target_sr)
+            wav = wav_t.squeeze(0).numpy()
+
+        device = next(state.tts.parameters()).device
+        waveform = torch.from_numpy(wav.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(device)
+        with torch.no_grad():
+            style_ttl, style_dp = state.tts.audio_encoder(waveform)
+
+        voices_dir = get_custom_voices_dir()
+        meta = voice_manager.save_voice(
+            voices_dir, name,
+            style_ttl=style_ttl,
+            style_dp=style_dp,
+            consent=consent,
+            ref_text=ref_text,
+            speaker_description=speaker_description,
+            mime_type=audio_sample.content_type or "audio/wav",
+            file_size=file_size,
+        )
+
+        return {"success": True, "voice": meta}
+
+    app.include_router(voice_router)
