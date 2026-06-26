@@ -9,6 +9,8 @@ services:
         BASE_IMAGE: python:3.11-slim
     image: supertonic:latest
     container_name: supertonic-api
+    networks:
+      - supertonic-net
     ports:
       - "${SUPERTONIC_SERVE_PORT:-7788}:7788"
     environment:
@@ -54,3 +56,7 @@ services:
 volumes:
   supertonic_cache:
     name: supertonic_cache
+
+networks:
+  supertonic-net:
+    name: supertonic-net
