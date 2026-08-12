@@ -123,6 +123,18 @@ class HealthResponse(BaseModel):
     voices_loaded: int = 0
 
 
+class ModelInfo(BaseModel):
+    id: str
+    object: str = "model"
+    created: int = 0
+    owned_by: str = "supertone"
+
+
+class ModelsResponse(BaseModel):
+    object: str = "list"
+    data: List[ModelInfo]
+
+
 class ErrorDetail(BaseModel):
     message: str
     type: str = "invalid_request_error"
