@@ -52,6 +52,8 @@ from .schemas import (
     ErrorDetail,
     ErrorEnvelope,
     HealthResponse,
+    ModelInfo,
+    ModelsResponse,
     OpenAISpeechRequest,
     StyleImportResponse,
     StyleInfo,
@@ -196,6 +198,13 @@ def register_routes(app: FastAPI) -> None:
             sample_rate=state.tts.sample_rate,
             version=__version__,
             voices_loaded=len(state.tts.voice_style_names) + len(state.custom_styles) + len(voice_manager.list_voices(get_custom_voices_dir())),
+        )
+
+    @router.get("/v1/models", response_model=ModelsResponse)
+    def list_models(request: Request):
+        state = _state(request)
+        return ModelsResponse(
+            data=[ModelInfo(id=state.model)]
         )
 
     @router.get("/v1/styles", response_model=StylesResponse)
